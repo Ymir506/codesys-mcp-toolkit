@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `import_plcopenxml` tool: import a PLCopenXML (`.xml`) file into a project (top level) or into a target object/folder. Supports `importFolderStructure` and `conflictResolution` (Replace/Copy/Skip), and reports the number of added objects plus any errors/warnings via an `ImportReporter`.
+
+### Changed
+- `compile_project` now reads the CODESYS message store after `build()` and returns structured build results — error and warning counts plus the actual compiler messages — and sets the error flag accordingly, instead of only reporting that compilation was "initiated". Falls back honestly (no false "0 errors") when the message store cannot be read.
+
+### Notes
+- Implemented in `src/server.ts` (inline Python script templates + tool handlers). Verified against CODESYS V3.5 SP21 Patch 2 via a standalone MCP client: an injected ST syntax error raised the reported error count, and a PLCopenXML import reported the correct added-object count.
+
 ## [1.1.16] - 2025-05-06
 
 ### Fixed

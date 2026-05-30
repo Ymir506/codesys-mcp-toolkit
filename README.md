@@ -19,7 +19,10 @@ A Model Context Protocol (MCP) server for CODESYS V3 programming environments. T
   - Set declaration and implementation code (`set_pou_code`)
   - Create properties for Function Blocks (`create_property`)
   - Create methods for Function Blocks (`create_method`)
-  - Compile projects (`compile_project`)
+  - Compile projects with structured build results — error/warning counts and the actual compiler messages, not just "initiated" (`compile_project`)
+
+- **Import / Export**
+  - Import PLCopenXML (`.xml`) into a project or a target object/folder, with conflict resolution and an added-object count (`import_plcopenxml`)
 
 - **MCP Resources**
   - `codesys://project/status`: Check scripting status and currently open project state.
