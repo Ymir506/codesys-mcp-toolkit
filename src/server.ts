@@ -854,10 +854,69 @@ try:
     target_app.build();
     print("DEBUG: Build command executed for application '%s'." % app_name)
 
-    # Check messages is harder without direct access to message store from script.
-    # Rely on CODESYS UI or log output for now.
-    print("Compile Initiated For Application: %s" % app_name); print("In Project: %s" % project_name)
-    print("SCRIPT_SUCCESS: Application compilation initiated."); sys.exit(0)
+    # --- Evaluate build results via the message store ---
+    # build() explicitly supports reading compiler messages afterwards via
+    # System.get_message_objects(). Severity bit flags: FatalError=1, Error=2, Warning=4.
+    errors = 0
+    warnings = 0
+    detail_lines = []
+    messages_read = False
+    query_failed = False
+    try:
+        _sys = None
+        try:
+            _sys = system
+        except NameError:
+            _sys = getattr(script_engine, 'system', None)
+        if _sys is None:
+            raise RuntimeError("Scripting 'system' object not available.")
+
+        def _msg_text(m):
+            t = getattr(m, 'text', None)
+            return t if t else str(m)
+
+        # Severity is an enum; the API rejects raw ints for the severities filter.
+        sev_enum = getattr(script_engine, 'Severity', None)
+        if sev_enum is None:
+            raise RuntimeError("Severity enum not available.")
+        error_severities = [sev_enum.FatalError, sev_enum.Error]
+
+        # Only categories that received a message this session (fresh CODESYS per call).
+        active_categories = _sys.get_message_categories(True)
+        for cat in active_categories:
+            cat_id = str(cat)  # get_message_objects expects the category Guid as a string
+            try:
+                for sev in error_severities:
+                    for m in _sys.get_message_objects(category=cat_id, severities=sev):
+                        errors += 1
+                        detail_lines.append("ERROR: %s" % _msg_text(m))
+                for m in _sys.get_message_objects(category=cat_id, severities=sev_enum.Warning):
+                    warnings += 1
+                    detail_lines.append("WARNING: %s" % _msg_text(m))
+            except Exception as ce:
+                query_failed = True
+                print("DEBUG: Could not read messages for category %s: %s" % (cat_id, ce))
+        messages_read = not query_failed
+    except Exception as msg_err:
+        print("WARN: Could not read build messages from store: %s" % msg_err)
+
+    print("--- BUILD RESULT START ---")
+    print("Messages Read: %s" % messages_read)
+    if messages_read:
+        print("Errors: %d" % errors)
+        print("Warnings: %d" % warnings)
+        for line in detail_lines:
+            print(line)
+    else:
+        print("Note: build messages could not be read from the store; see raw output / CODESYS messages.")
+    print("--- BUILD RESULT END ---")
+
+    print("Compiled Application: %s" % app_name); print("In Project: %s" % project_name)
+    if messages_read and errors > 0:
+        print("SCRIPT_ERROR: Build failed with %d error(s) and %d warning(s)." % (errors, warnings)); sys.exit(1)
+    if messages_read:
+        print("SCRIPT_SUCCESS: Build completed with %d error(s), %d warning(s)." % (errors, warnings)); sys.exit(0)
+    print("SCRIPT_SUCCESS: Build command executed (results unavailable)."); sys.exit(0)
 except Exception as e:
     detailed_error = traceback.format_exc()
     error_message = "Error initiating compilation for project %s: %s\\n%s" % (PROJECT_FILE_PATH, e, detailed_error)
@@ -1004,6 +1063,115 @@ try:
 except Exception as e:
     detailed_error = traceback.format_exc()
     error_message = "Error getting code for object '%s' in project '%s': %s\\n%s" % (POU_FULL_PATH, PROJECT_FILE_PATH, e, detailed_error)
+    print(error_message); print("SCRIPT_ERROR: %s" % error_message); sys.exit(1)
+`;
+
+    const IMPORT_XML_SCRIPT_TEMPLATE = `
+import sys, scriptengine as script_engine, os, traceback
+${ENSURE_PROJECT_OPEN_PYTHON_SNIPPET}
+${FIND_OBJECT_BY_PATH_PYTHON_SNIPPET}
+XML_FILE_PATH = r"{XML_FILE_PATH}"
+TARGET_PATH = "{TARGET_PATH}"
+IMPORT_FOLDER_STRUCTURE = {IMPORT_FOLDER_STRUCTURE}
+CONFLICT_RESOLVE_NAME = "{CONFLICT_RESOLVE}"
+
+# Resolve the requested conflict strategy (Replace / Copy / Skip), defaulting to Replace.
+_conflict = script_engine.ConflictResolve.Replace
+try:
+    _conflict = getattr(script_engine.ConflictResolve, CONFLICT_RESOLVE_NAME, script_engine.ConflictResolve.Replace)
+except Exception as _ce:
+    print("WARN: Could not resolve ConflictResolve.%s: %s" % (CONFLICT_RESOLVE_NAME, _ce))
+
+# Reporter implementing IImportReporter to collect errors/warnings and drive conflict resolution.
+class _ImportReporter(script_engine.ImportReporter):
+    def __init__(self, conflict):
+        self.errors = []
+        self.warnings = []
+        self.added_count = 0
+        self._conflict = conflict
+    def error(self, message):
+        self.errors.append(str(message))
+    def warning(self, message):
+        self.warnings.append(str(message))
+    def resolve_conflict(self, obj):
+        return self._conflict
+    def added(self, obj):
+        self.added_count += 1
+
+try:
+    print("DEBUG: import_xml script: XML='%s', Target='%s', FolderStruct=%s, Conflict=%s, Project='%s'" % (XML_FILE_PATH, TARGET_PATH, IMPORT_FOLDER_STRUCTURE, CONFLICT_RESOLVE_NAME, PROJECT_FILE_PATH))
+    primary_project = ensure_project_open(PROJECT_FILE_PATH)
+    if not XML_FILE_PATH: raise ValueError("PLCopenXML file path empty.")
+    XML_FILE_PATH = os.path.normpath(XML_FILE_PATH)
+    if not os.path.exists(XML_FILE_PATH): raise IOError("PLCopenXML file not found: %s" % XML_FILE_PATH)
+
+    reporter = _ImportReporter(_conflict)
+
+    def _import_into(obj, label):
+        # import_xml signatures differ across object/project types (reporter is the
+        # 2nd positional argument in practice). Try positional forms, degrade gracefully.
+        attempts = [
+            lambda: obj.import_xml(XML_FILE_PATH, reporter, IMPORT_FOLDER_STRUCTURE),
+            lambda: obj.import_xml(XML_FILE_PATH, reporter),
+            lambda: obj.import_xml(XML_FILE_PATH),
+        ]
+        last_err = None
+        for attempt in attempts:
+            try:
+                attempt()
+                return
+            except TypeError as te:
+                last_err = te
+                print("DEBUG: import_xml call form failed for %s: %s" % (label, te))
+        raise last_err
+
+    def _child_names(obj):
+        try:
+            return set(getattr(c, 'get_name', lambda: str(c))() for c in obj.get_children(False))
+        except Exception as che:
+            print("DEBUG: Could not list children: %s" % che)
+            return set()
+
+    # Resolve the container and snapshot its children so we can report an accurate
+    # added count (the reporter.added() callback does not fire reliably).
+    if TARGET_PATH:
+        container = find_object_by_path_robust(primary_project, TARGET_PATH, "import target")
+        if not container: raise ValueError("Target object not found for path: %s" % TARGET_PATH)
+        if not hasattr(container, 'import_xml'):
+            raise TypeError("Target object '%s' (%s) does not support import_xml." % (TARGET_PATH, type(container).__name__))
+        container_label = TARGET_PATH
+    else:
+        container = primary_project
+        container_label = "<project>"
+
+    before_names = _child_names(container)
+    print("DEBUG: Importing PLCopenXML into '%s' (%d existing children)..." % (container_label, len(before_names)))
+    _import_into(container, container_label)
+    after_names = _child_names(container)
+    added_objects = len(after_names - before_names)
+    print("DEBUG: import_xml returned. Net new children: %d (reporter.added=%d)" % (added_objects, reporter.added_count))
+
+    try:
+        primary_project.save()
+        print("DEBUG: Project saved after import.")
+    except Exception as save_err:
+        print("WARN: Failed to save project after import: %s" % save_err)
+
+    print("--- IMPORT RESULT START ---")
+    print("Added: %d" % added_objects)
+    print("Errors: %d" % len(reporter.errors))
+    print("Warnings: %d" % len(reporter.warnings))
+    for e in reporter.errors: print("ERROR: %s" % e)
+    for w in reporter.warnings: print("WARNING: %s" % w)
+    print("--- IMPORT RESULT END ---")
+
+    if reporter.errors:
+        print("SCRIPT_ERROR: PLCopenXML import completed with %d error(s)." % len(reporter.errors)); sys.exit(1)
+    print("Imported PLCopenXML: %s" % XML_FILE_PATH)
+    print("SCRIPT_SUCCESS: PLCopenXML import successful (%d added, %d warning(s))." % (added_objects, len(reporter.warnings))); sys.exit(0)
+except Exception as e:
+    detailed_error = traceback.format_exc()
+    error_message = "Error importing PLCopenXML '%s' into project '%s': %s\\n%s" % (XML_FILE_PATH, PROJECT_FILE_PATH, e, detailed_error)
     print(error_message); print("SCRIPT_ERROR: %s" % error_message); sys.exit(1)
 `;
 
@@ -1401,20 +1569,109 @@ except Exception as e:
                 const escapedPath = absPath.replace(/\\/g, '\\\\');
                 const script = COMPILE_PROJECT_SCRIPT_TEMPLATE.replace("{PROJECT_FILE_PATH}", escapedPath);
                 const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
-                const success = result.success && result.output.includes("SCRIPT_SUCCESS");
-                // Check for actual compile errors in the output log
-                const hasCompileErrors = result.output.includes("Compile complete --") && !/ 0 error\(s\),/.test(result.output);
-                let message = success ? `Compilation initiated for application in ${absPath}. Check CODESYS messages for results.` : `Failed initiating compilation for ${absPath}. Output:\n${result.output}`;
-                let isError = !success; // Base error status on script success
-                if (success && hasCompileErrors) {
-                    message += " WARNING: Build command reported errors in the output log.";
-                    console.warn("Compile project reported build errors in the output.");
-                    // Report as error if compile fails, even if script technically succeeded
-                    isError = true;
+                const scriptSucceeded = result.success && result.output.includes("SCRIPT_SUCCESS");
+                // Parse the structured build result emitted by the compile script.
+                const errMatch = result.output.match(/Errors:\s*(\d+)/);
+                const warnMatch = result.output.match(/Warnings:\s*(\d+)/);
+                const errorCount: number | null = errMatch ? parseInt(errMatch[1], 10) : null;
+                const warningCount: number | null = warnMatch ? parseInt(warnMatch[1], 10) : null;
+                // Extract the detail lines (individual errors/warnings) between the markers.
+                let details = "";
+                const startMarker = "--- BUILD RESULT START ---";
+                const endMarker = "--- BUILD RESULT END ---";
+                const sIdx = result.output.indexOf(startMarker);
+                const eIdx = result.output.indexOf(endMarker);
+                if (sIdx !== -1 && eIdx !== -1 && sIdx < eIdx) {
+                    details = result.output.substring(sIdx + startMarker.length, eIdx)
+                        .split(/[\r\n]+/).filter((l: string) => /^(ERROR|WARNING):/.test(l.trim())).join("\n");
+                }
+                let isError = !scriptSucceeded || (errorCount !== null && errorCount > 0);
+                let message: string;
+                if (errorCount !== null) {
+                    message = (errorCount > 0)
+                        ? `Build FAILED for ${absPath}: ${errorCount} error(s), ${warningCount} warning(s).`
+                        : `Build succeeded for ${absPath}: ${errorCount} error(s), ${warningCount} warning(s).`;
+                    if (details)
+                        message += `\n\n${details}`;
+                } else {
+                    // Fallback: build messages could not be parsed (e.g. message store unavailable).
+                    message = scriptSucceeded
+                        ? `Compilation completed for ${absPath}, but build results could not be parsed. Output:\n${result.output}`
+                        : `Failed compiling ${absPath}. Output:\n${result.output}`;
                 }
                 return { content: [{ type: "text", text: message }], isError: isError };
             } catch (e:any) {
                 console.error(`Error compile_project ${absPath}: ${e}`);
+                return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
+            }
+        }
+    );
+
+    server.tool(
+        "import_plcopenxml", // Tool Name
+        "Imports a PLCopenXML (.xml) file into a CODESYS project, either at the project top level or as children of a target object/folder. Returns the number of added objects plus any errors/warnings.", // Tool Description
+        { // Input Schema
+            projectFilePath: z.string().describe("Path to the project file (e.g., 'C:/Projects/MyPLC.project')."),
+            xmlFilePath: z.string().describe("Path to the PLCopenXML (.xml) file to import (e.g., 'C:/Exports/MyPou.xml')."),
+            targetPath: z.string().optional().describe("Optional relative path of the object or folder to import INTO (e.g., 'Application' or 'Application/MyFolder'). If omitted, objects are imported at the project top level."),
+            importFolderStructure: z.boolean().optional().describe("If true, also import the (proprietary) folder structure extension. Defaults to false."),
+            conflictResolution: z.enum(["Replace", "Copy", "Skip"]).optional().describe("How to resolve conflicts when an imported object already exists: Replace (overwrite, default), Copy (keep both), or Skip (keep existing).")
+        },
+        async (args) => { // Handler
+            const { projectFilePath, xmlFilePath, targetPath, importFolderStructure, conflictResolution } = args;
+            let absPath = path.normalize(path.isAbsolute(projectFilePath) ? projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+            let absXmlPath = path.normalize(path.isAbsolute(xmlFilePath) ? xmlFilePath : path.join(WORKSPACE_DIR, xmlFilePath));
+            const sanTarget = (targetPath ?? "").replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+            const folderStruct = importFolderStructure ? "True" : "False";
+            const conflict = conflictResolution ?? "Replace";
+            console.error(`Tool call: import_plcopenxml: XML='${absXmlPath}', Target='${sanTarget}', Conflict='${conflict}', Project='${absPath}'`);
+            try {
+                if (!(await fileExists(absXmlPath))) {
+                    return { content: [{ type: "text", text: `Error: PLCopenXML file not found: ${absXmlPath}` }], isError: true };
+                }
+                const escProjPath = absPath.replace(/\\/g, '\\\\');
+                const escXmlPath = absXmlPath.replace(/\\/g, '\\\\');
+                let script = IMPORT_XML_SCRIPT_TEMPLATE.replace("{PROJECT_FILE_PATH}", escProjPath);
+                script = script.replace("{XML_FILE_PATH}", escXmlPath);
+                script = script.replace("{TARGET_PATH}", sanTarget);
+                script = script.replace("{IMPORT_FOLDER_STRUCTURE}", folderStruct);
+                script = script.replace("{CONFLICT_RESOLVE}", conflict);
+                console.error(">>> import_plcopenxml: PREPARED SCRIPT:", script.substring(0, 500) + "...");
+                const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
+                console.error(">>> import_plcopenxml: EXECUTION RESULT:", JSON.stringify(result));
+                const scriptSucceeded = result.success && result.output.includes("SCRIPT_SUCCESS");
+                // Parse the structured import result.
+                const addedMatch = result.output.match(/Added:\s*(\d+)/);
+                const errMatch = result.output.match(/Errors:\s*(\d+)/);
+                const warnMatch = result.output.match(/Warnings:\s*(\d+)/);
+                const addedCount: number | null = addedMatch ? parseInt(addedMatch[1], 10) : null;
+                const errorCount: number | null = errMatch ? parseInt(errMatch[1], 10) : null;
+                const warningCount: number | null = warnMatch ? parseInt(warnMatch[1], 10) : null;
+                let details = "";
+                const startMarker = "--- IMPORT RESULT START ---";
+                const endMarker = "--- IMPORT RESULT END ---";
+                const sIdx = result.output.indexOf(startMarker);
+                const eIdx = result.output.indexOf(endMarker);
+                if (sIdx !== -1 && eIdx !== -1 && sIdx < eIdx) {
+                    details = result.output.substring(sIdx + startMarker.length, eIdx)
+                        .split(/[\r\n]+/).filter((l: string) => /^(ERROR|WARNING):/.test(l.trim())).join("\n");
+                }
+                let isError = !scriptSucceeded || (errorCount !== null && errorCount > 0);
+                let message: string;
+                if (addedCount !== null || errorCount !== null) {
+                    message = isError
+                        ? `PLCopenXML import FAILED for ${absXmlPath}: ${errorCount ?? '?'} error(s), ${warningCount ?? '?'} warning(s).`
+                        : `PLCopenXML imported into ${absPath}: ${addedCount ?? '?'} object(s) added, ${warningCount ?? 0} warning(s). Project saved.`;
+                    if (details)
+                        message += `\n\n${details}`;
+                } else {
+                    message = scriptSucceeded
+                        ? `PLCopenXML import completed for ${absPath}, but results could not be parsed. Output:\n${result.output}`
+                        : `Failed importing PLCopenXML '${absXmlPath}'. Output:\n${result.output}`;
+                }
+                return { content: [{ type: "text", text: message }], isError: isError };
+            } catch (e:any) {
+                console.error(`Error import_plcopenxml ${absXmlPath} into ${absPath}: ${e}`);
                 return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
             }
         }
