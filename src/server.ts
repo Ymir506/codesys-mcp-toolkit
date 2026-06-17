@@ -1316,6 +1316,131 @@ except Exception as e:
     print("SCRIPT_ERROR: %s\\n%s" % (e, traceback.format_exc())); sys.exit(1)
 `;
 
+    const CATALOG_LIST_SCRIPT_TEMPLATE = `
+import sys, scriptengine as script_engine, os, traceback
+${ENSURE_PROJECT_OPEN_PYTHON_SNIPPET}
+INCLUDE_MEMBERS = {INCLUDE_MEMBERS}
+
+def _decl(o):
+    try:
+        if getattr(o, "has_textual_declaration", False):
+            t = o.textual_declaration.text or ""
+            for ln in t.split(chr(10)):
+                s = ln.strip()
+                if s and not s.startswith("//") and not s.startswith("(*"):
+                    return s
+    except Exception:
+        pass
+    return ""
+
+_count = [0]
+def _walk(o, depth):
+    try:
+        children = o.get_children(False)
+    except Exception:
+        return
+    for c in children:
+        try: name = c.get_name()
+        except Exception: name = "<?>"
+        is_folder = bool(getattr(c, "is_folder", False))
+        decl = _decl(c)
+        kind = "FOLDER" if is_folder else (decl.split(" ")[0] if decl else "")
+        is_member = decl.startswith("METHOD") or decl.startswith("PROPERTY") or decl.startswith("{attribute") or name in ("Get", "Set")
+        show = INCLUDE_MEMBERS or (not is_member)
+        if show:
+            _count[0] += 1
+            print("ITEM: %s%s | %s | %s" % ("  " * depth, name, kind, decl[:90]))
+            _walk(c, depth + 1)
+
+try:
+    proj = ensure_project_open(PROJECT_FILE_PATH)
+    print("--- CATALOG START ---")
+    _walk(proj, 0)
+    print("--- CATALOG END ---")
+    print("Count: %d" % _count[0])
+    print("SCRIPT_SUCCESS: catalog listed (%d items)." % _count[0]); sys.exit(0)
+except Exception as e:
+    print("SCRIPT_ERROR: %s" % e); traceback.print_exc(); sys.exit(1)
+`;
+
+    const SIM_RUN_SCRIPT_TEMPLATE = `
+import sys, scriptengine as script_engine, os, time, traceback
+${ENSURE_PROJECT_OPEN_PYTHON_SNIPPET}
+READ_VARS = {READ_VARS}
+FORCE_VARS = {FORCE_VARS}
+RUN_SECONDS = {RUN_SECONDS}
+DO_BUILD = {DO_BUILD}
+
+oa = None; dev = None
+try:
+    p = ensure_project_open(PROJECT_FILE_PATH)
+    app = p.active_application or (p.find("Application", True) or [None])[0]
+    if app is None:
+        raise RuntimeError("No application found.")
+    if DO_BUILD and hasattr(app, "build"):
+        app.build()
+    for c in p.get_children(False):
+        if getattr(c, "is_device", False):
+            dev = c; break
+    if dev is None:
+        raise RuntimeError("No device found in project.")
+    dev.set_simulation_mode(True)
+    _online = None
+    try: _online = online
+    except NameError: _online = getattr(script_engine, "online", None)
+    if _online is None:
+        raise RuntimeError("Scripting 'online' object not available.")
+    oa = _online.create_online_application(app)
+    oa.login(script_engine.OnlineChangeOption.Never, True)
+    try: oa.start()
+    except Exception as start_err:
+        print("DEBUG: start raised: %s" % type(start_err).__name__)
+    state = None
+    for k in range(8):
+        try: state = str(oa.application_state)
+        except Exception: state = None
+        if state == "run": break
+        time.sleep(1.0)
+    forced = []
+    for fv in FORCE_VARS:
+        if "=" in fv:
+            expr, val = fv.split("=", 1)
+            try:
+                oa.set_prepared_value(expr.strip(), val.strip()); forced.append(expr.strip())
+            except Exception as fe:
+                print("WARN: force %s failed: %s" % (fv, fe))
+    if forced:
+        try: oa.force_prepared_values()
+        except Exception as fpe: print("WARN: force_prepared_values: %s" % fpe)
+    if RUN_SECONDS > 0:
+        time.sleep(RUN_SECONDS)
+    print("--- SIM RESULT START ---")
+    print("State: %s" % state)
+    print("Forced: %d" % len(forced))
+    for v in READ_VARS:
+        try: print("VALUE: %s = %s" % (v, oa.read_value(v)))
+        except Exception as rd_err: print("VALUE: %s = <error: %s>" % (v, rd_err))
+    print("--- SIM RESULT END ---")
+    if state == "run":
+        print("SCRIPT_SUCCESS: simulation ran (state=%s)." % state); sys.exit(0)
+    print("SCRIPT_ERROR: simulation did not reach run (state=%s)." % state); sys.exit(1)
+except Exception as e:
+    print("SCRIPT_ERROR: %s" % e); traceback.print_exc(); sys.exit(1)
+finally:
+    try:
+        if oa is not None:
+            try: oa.unforce_all_values()
+            except Exception: pass
+            try: oa.stop()
+            except Exception: pass
+            try: oa.logout()
+            except Exception: pass
+        if dev is not None:
+            try: dev.set_simulation_mode(False)
+            except Exception: pass
+    except Exception: pass
+`;
+
     // --- End Python Script Templates ---
 
     // --- Zod Schemas (moved for clarity before usage) ---
@@ -1885,6 +2010,100 @@ except Exception as e:
                 return { content: [{ type: "text", text: message }], isError: isError };
             } catch (e:any) {
                 console.error(`Error cfc_add_device: ${e}`);
+                return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
+            }
+        }
+    );
+    server.tool(
+        "catalog_list", // Tool Name
+        "Lists the objects (POUs/FBs/interfaces/GVLs/folders) in a CODESYS project or library (.project or .library), with each object's first declaration line. Use to inspect/verify a block catalog. By default skips members (methods/properties); set includeMembers to include them.", // Description
+        { // Input Schema
+            targetPath: z.string().describe("Path to the .project or .library file to enumerate."),
+            includeMembers: z.boolean().optional().describe("If true, also list methods/properties/accessors. Defaults to false (compact, types only).")
+        },
+        async (args) => { // Handler
+            const { targetPath, includeMembers } = args;
+            let absPath = path.normalize(path.isAbsolute(targetPath) ? targetPath : path.join(WORKSPACE_DIR, targetPath));
+            console.error(`Tool call: catalog_list: ${absPath} (members=${!!includeMembers})`);
+            try {
+                if (!(await fileExists(absPath))) {
+                    return { content: [{ type: "text", text: `Error: file not found: ${absPath}` }], isError: true };
+                }
+                const escPath = absPath.replace(/\\/g, '\\\\');
+                let script = CATALOG_LIST_SCRIPT_TEMPLATE.replace("{PROJECT_FILE_PATH}", escPath);
+                script = script.replace("{INCLUDE_MEMBERS}", includeMembers ? "True" : "False");
+                const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
+                const scriptSucceeded = result.success && result.output.includes("SCRIPT_SUCCESS");
+                const countMatch = result.output.match(/Count:\s*(\d+)/);
+                const count = countMatch ? parseInt(countMatch[1], 10) : null;
+                let listing = "";
+                const sIdx = result.output.indexOf("--- CATALOG START ---");
+                const eIdx = result.output.indexOf("--- CATALOG END ---");
+                if (sIdx !== -1 && eIdx !== -1 && sIdx < eIdx) {
+                    listing = result.output.substring(sIdx + "--- CATALOG START ---".length, eIdx).trim();
+                }
+                let message: string;
+                if (scriptSucceeded) {
+                    message = `Catalog of ${absPath}${count !== null ? ` (${count} item(s))` : ''}:\n\n${listing}`;
+                } else {
+                    message = `catalog_list failed for ${absPath}. Output:\n${result.output}`;
+                }
+                return { content: [{ type: "text", text: message }], isError: !scriptSucceeded };
+            } catch (e:any) {
+                console.error(`Error catalog_list ${absPath}: ${e}`);
+                return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
+            }
+        }
+    );
+
+    server.tool(
+        "sim_run", // Tool Name
+        "Runs the primary application of a CODESYS project in headless SIMULATION: optionally builds, logs in to the simulated device, starts it, optionally forces variables, reads back variable values, then stops and logs out (cleanly). The project must NOT be open in a CODESYS GUI. Returns the run state and the requested variable values.", // Description
+        { // Input Schema
+            projectFilePath: z.string().describe("Path to the .project file."),
+            readVariables: z.array(z.string()).optional().describe("Variables to read after start, e.g. ['GVL.L104.PV','PLC_PRG.Anlage']."),
+            forceVariables: z.array(z.string()).optional().describe("Variables to force before reading, each as 'expr=value' (e.g. 'GVL.N101.MANUAL=TRUE')."),
+            runSeconds: z.number().optional().describe("Seconds to let the simulation run before reading. Defaults to 2."),
+            build: z.boolean().optional().describe("Build before simulating. Defaults to true.")
+        },
+        async (args) => { // Handler
+            const { projectFilePath, readVariables, forceVariables, runSeconds, build } = args;
+            let absPath = path.normalize(path.isAbsolute(projectFilePath) ? projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+            const readPy = JSON.stringify(readVariables ?? []);
+            const forcePy = JSON.stringify(forceVariables ?? []);
+            const runSecs = (typeof runSeconds === 'number' && runSeconds >= 0) ? String(runSeconds) : "2";
+            const doBuild = (build === false) ? "False" : "True";
+            console.error(`Tool call: sim_run: ${absPath} read=${readPy} force=${forcePy} secs=${runSecs}`);
+            try {
+                const escPath = absPath.replace(/\\/g, '\\\\');
+                let script = SIM_RUN_SCRIPT_TEMPLATE.replace("{PROJECT_FILE_PATH}", escPath);
+                script = script.replace("{READ_VARS}", readPy);
+                script = script.replace("{FORCE_VARS}", forcePy);
+                script = script.replace("{RUN_SECONDS}", runSecs);
+                script = script.replace("{DO_BUILD}", doBuild);
+                const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
+                const scriptSucceeded = result.success && result.output.includes("SCRIPT_SUCCESS");
+                const stateMatch = result.output.match(/State:\s*(\w+)/);
+                let block = "";
+                const sIdx = result.output.indexOf("--- SIM RESULT START ---");
+                const eIdx = result.output.indexOf("--- SIM RESULT END ---");
+                if (sIdx !== -1 && eIdx !== -1 && sIdx < eIdx) {
+                    block = result.output.substring(sIdx, eIdx + "--- SIM RESULT END ---".length);
+                }
+                const isError = !scriptSucceeded;
+                let message: string;
+                if (block) {
+                    message = isError
+                        ? `sim_run did not reach 'run' for ${absPath} (state=${stateMatch ? stateMatch[1] : '?'}).\n\n${block}`
+                        : `Simulation ran for ${absPath} (state=${stateMatch ? stateMatch[1] : '?'}).\n\n${block}`;
+                } else {
+                    message = scriptSucceeded
+                        ? `sim_run completed but results could not be parsed. Output:\n${result.output}`
+                        : `sim_run failed for ${absPath}. Output:\n${result.output}`;
+                }
+                return { content: [{ type: "text", text: message }], isError: isError };
+            } catch (e:any) {
+                console.error(`Error sim_run ${absPath}: ${e}`);
                 return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
             }
         }
