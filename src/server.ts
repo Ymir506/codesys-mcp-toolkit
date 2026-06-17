@@ -1175,6 +1175,147 @@ except Exception as e:
     print(error_message); print("SCRIPT_ERROR: %s" % error_message); sys.exit(1)
 `;
 
+    const CFC_ADD_DEVICE_SCRIPT_TEMPLATE = `
+import sys, scriptengine as script_engine, os, re, uuid, traceback
+${ENSURE_PROJECT_OPEN_PYTHON_SNIPPET}
+TEMPLATE_PATH = r"{TEMPLATE_PATH}"
+NEW_NAME = "{NEW_NAME}"
+NEW_INSTANCE = "{NEW_INSTANCE}"
+INSTANCE_TYPE = "{INSTANCE_TYPE}"
+TARGET_FOLDER = "{TARGET_FOLDER}"
+GVL_NAME = "{GVL_NAME}"
+INTERLOCK = "{INTERLOCK}"
+DO_BUILD = {DO_BUILD}
+
+def _find_value(text, pat):
+    m = re.search(pat, text)
+    return m.group(1) if m else None
+
+try:
+    primary_project = ensure_project_open(PROJECT_FILE_PATH)
+    TEMPLATE_PATH = os.path.normpath(TEMPLATE_PATH)
+    if not os.path.exists(TEMPLATE_PATH):
+        raise IOError("Template export not found: %s" % TEMPLATE_PATH)
+    f = open(TEMPLATE_PATH, "r"); xml = f.read(); f.close()
+
+    # --- auto-detect template name / bound instance / FB type ---
+    old_name = _find_value(xml, '<Single Name="Name" Type="string">([^<]+)</Single>')
+    box_type = _find_value(xml, '<Single Name="BoxType" Type="string">([^<]+)</Single>')
+    old_inst = None
+    ipos = xml.find('<Single Name="Instance"')
+    if ipos != -1:
+        old_inst = _find_value(xml[ipos:], '<Single Name="Operand" Type="string">([^<]+)</Single>')
+    if not old_name or not old_inst:
+        raise RuntimeError("Could not detect template name/instance (name=%s inst=%s)." % (old_name, old_inst))
+    inst_type = INSTANCE_TYPE if INSTANCE_TYPE else (box_type if box_type else "")
+    if not inst_type:
+        raise RuntimeError("No instanceType given and BoxType not found in template.")
+    print("DEBUG: cfc_add_device: template name=%s inst=%s box=%s -> new name=%s inst=%s type=%s" % (old_name, old_inst, box_type, NEW_NAME, NEW_INSTANCE, inst_type))
+
+    # --- rebind (pure text) ---
+    xml = xml.replace(">" + old_name + "<", ">" + NEW_NAME + "<")
+    xml = xml.replace("PROGRAM " + old_name, "PROGRAM " + NEW_NAME)
+    xml = xml.replace('<Single Name="Operand" Type="string">' + old_inst + '</Single>', '<Single Name="Operand" Type="string">' + NEW_INSTANCE + '</Single>')
+    if INTERLOCK:
+        xml = xml.replace('<Single Name="Operand" Type="string">FALSE</Single>', '<Single Name="Operand" Type="string">' + INTERLOCK + '</Single>', 1)
+    gm = re.search('<Single Name="Guid" Type="System.Guid">([^<]+)</Single>', xml)
+    if gm:
+        xml = xml[:gm.start(1)] + str(uuid.uuid4()) + xml[gm.end(1):]
+
+    gen_path = os.path.join(os.path.dirname(TEMPLATE_PATH), NEW_NAME + "_gen.export")
+    g = open(gen_path, "w"); g.write(xml); g.close()
+
+    app = primary_project.active_application
+
+    # --- ensure the new instance is declared in the GVL ---
+    gvl = None
+    for c in primary_project.get_children(True):
+        try:
+            if c.get_name() == GVL_NAME and getattr(c, "has_textual_declaration", False):
+                gvl = c; break
+        except Exception:
+            pass
+    gvl_changed = False
+    if gvl is not None:
+        decl = gvl.textual_declaration.text
+        compact = decl.replace(" ", "").replace(chr(9), "")
+        if (NEW_INSTANCE + ":") not in compact:
+            idx = decl.rfind("END_VAR")
+            if idx == -1:
+                raise RuntimeError("GVL '%s' has no END_VAR." % GVL_NAME)
+            ins = chr(9) + NEW_INSTANCE + " : " + inst_type + ";" + chr(10)
+            gvl.textual_declaration.replace(decl[:idx] + ins + decl[idx:])
+            gvl_changed = True
+    else:
+        print("WARN: GVL '%s' not found; instance not declared." % GVL_NAME)
+
+    # --- remove any existing same-name program (idempotent), then import ---
+    for o in list(primary_project.find(NEW_NAME, True)):
+        try: o.remove()
+        except Exception: pass
+    folder = None
+    for c in primary_project.get_children(True):
+        try:
+            if c.get_name() == TARGET_FOLDER and getattr(c, "is_folder", False):
+                folder = c; break
+        except Exception:
+            pass
+    if folder is None:
+        folder = app
+    folder.import_native([gen_path])
+    objs = list(primary_project.find(NEW_NAME, True))
+    added = len(objs)
+
+    # --- round-trip verification ---
+    has_box = False; has_inst = False
+    if objs:
+        reexp = os.path.join(os.path.dirname(TEMPLATE_PATH), NEW_NAME + "_reexport.export")
+        primary_project.export_native([objs[0]], reexp, recursive=True)
+        rf = open(reexp, "r"); rx = rf.read(); rf.close()
+        has_box = (box_type in rx) if box_type else False
+        has_inst = ('<Single Name="Operand" Type="string">' + NEW_INSTANCE + '</Single>') in rx
+
+    primary_project.save()
+
+    # --- optional build + message-store evaluation ---
+    errors = 0; warnings = 0; messages_read = False; detail_lines = []
+    if DO_BUILD and app is not None and hasattr(app, "build"):
+        app.build()
+        try:
+            _sys = None
+            try: _sys = system
+            except NameError: _sys = getattr(script_engine, "system", None)
+            sev_enum = getattr(script_engine, "Severity", None)
+            if _sys is not None and sev_enum is not None:
+                for cat in _sys.get_message_categories(True):
+                    cid = str(cat)
+                    for sev in [sev_enum.FatalError, sev_enum.Error]:
+                        for m in _sys.get_message_objects(category=cid, severities=sev):
+                            errors += 1; detail_lines.append("ERROR: %s" % (getattr(m, "text", None) or str(m)))
+                    for m in _sys.get_message_objects(category=cid, severities=sev_enum.Warning):
+                        warnings += 1; detail_lines.append("WARNING: %s" % (getattr(m, "text", None) or str(m)))
+                messages_read = True
+        except Exception as msg_err:
+            print("WARN: build message read failed: %s" % msg_err)
+
+    print("--- CFC RESULT START ---")
+    print("Added: %d" % added)
+    print("Errors: %d" % errors)
+    print("Warnings: %d" % warnings)
+    print("Verify: box=%s instance=%s" % (has_box, has_inst))
+    print("GvlChanged: %s" % gvl_changed)
+    for line in detail_lines: print(line)
+    print("--- CFC RESULT END ---")
+
+    if added < 1:
+        print("SCRIPT_ERROR: device program '%s' was not created." % NEW_NAME); sys.exit(1)
+    if DO_BUILD and messages_read and errors > 0:
+        print("SCRIPT_ERROR: build failed with %d error(s)." % errors); sys.exit(1)
+    print("SCRIPT_SUCCESS: device '%s' (instance %s) added as CFC." % (NEW_NAME, NEW_INSTANCE)); sys.exit(0)
+except Exception as e:
+    print("SCRIPT_ERROR: %s\\n%s" % (e, traceback.format_exc())); sys.exit(1)
+`;
+
     // --- End Python Script Templates ---
 
     // --- Zod Schemas (moved for clarity before usage) ---
@@ -1672,6 +1813,78 @@ except Exception as e:
                 return { content: [{ type: "text", text: message }], isError: isError };
             } catch (e:any) {
                 console.error(`Error import_plcopenxml ${absXmlPath} into ${absPath}: ${e}`);
+                return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
+            }
+        }
+    );
+    server.tool(
+        "cfc_add_device", // Tool Name
+        "Adds a new device control program (CFC) to a CODESYS project by CLONING a template device CFC (.export) and rebinding it: program name, bound global FB instance (auto-declared in the GVL), a fresh object GUID, and optionally an interlock operand. Optionally builds and verifies. This is the headless-safe way to create device CFCs — hand-authored CFC loses its wiring on import.", // Description
+        { // Input Schema
+            projectFilePath: z.string().describe("Path to the .project file (e.g. 'C:/Projects/Plant.project')."),
+            templatePath: z.string().describe("Path to a source device CFC .export to clone (e.g. a motor/valve/sensor/controller template such as an Insulin-reference NS101.export)."),
+            newName: z.string().describe("Name of the new device program, e.g. 'NS_N5'."),
+            newInstance: z.string().describe("Name of the new global FB instance to bind, e.g. 'N5'. Declared in the GVL if missing."),
+            instanceType: z.string().optional().describe("FB type for the GVL declaration, e.g. 'TYP_IDF1'. If omitted, taken from the template's BoxType."),
+            targetFolder: z.string().optional().describe("Folder to import the program into. Defaults to 'CFCs'."),
+            gvlName: z.string().optional().describe("Global variable list to declare the instance in. Defaults to 'GVL'."),
+            interlock: z.string().optional().describe("Optional operand for the first lock input (e.g. 'L104.SL'). If omitted, the template's value is kept."),
+            build: z.boolean().optional().describe("Build the application and report errors afterwards. Defaults to true.")
+        },
+        async (args) => { // Handler
+            const { projectFilePath, templatePath, newName, newInstance, instanceType, targetFolder, gvlName, interlock, build } = args;
+            let absPath = path.normalize(path.isAbsolute(projectFilePath) ? projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+            let absTmpl = path.normalize(path.isAbsolute(templatePath) ? templatePath : path.join(WORKSPACE_DIR, templatePath));
+            const doBuild = (build === false) ? "False" : "True";
+            console.error(`Tool call: cfc_add_device: tmpl='${absTmpl}', new='${newName}', inst='${newInstance}', project='${absPath}'`);
+            try {
+                if (!(await fileExists(absTmpl))) {
+                    return { content: [{ type: "text", text: `Error: template export not found: ${absTmpl}` }], isError: true };
+                }
+                const escProj = absPath.replace(/\\/g, '\\\\');
+                const escTmpl = absTmpl.replace(/\\/g, '\\\\');
+                let script = CFC_ADD_DEVICE_SCRIPT_TEMPLATE.replace("{PROJECT_FILE_PATH}", escProj);
+                script = script.replace("{TEMPLATE_PATH}", escTmpl);
+                script = script.replace("{NEW_NAME}", newName);
+                script = script.replace("{NEW_INSTANCE}", newInstance);
+                script = script.replace("{INSTANCE_TYPE}", instanceType ?? "");
+                script = script.replace("{TARGET_FOLDER}", targetFolder ?? "CFCs");
+                script = script.replace("{GVL_NAME}", gvlName ?? "GVL");
+                script = script.replace("{INTERLOCK}", interlock ?? "");
+                script = script.replace("{DO_BUILD}", doBuild);
+                const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
+                const scriptSucceeded = result.success && result.output.includes("SCRIPT_SUCCESS");
+                const addedMatch = result.output.match(/Added:\s*(\d+)/);
+                const errMatch = result.output.match(/Errors:\s*(\d+)/);
+                const warnMatch = result.output.match(/Warnings:\s*(\d+)/);
+                const verifyMatch = result.output.match(/Verify:\s*box=(\w+)\s+instance=(\w+)/);
+                const addedCount: number | null = addedMatch ? parseInt(addedMatch[1], 10) : null;
+                const errorCount: number | null = errMatch ? parseInt(errMatch[1], 10) : null;
+                const warningCount: number | null = warnMatch ? parseInt(warnMatch[1], 10) : null;
+                let details = "";
+                const startMarker = "--- CFC RESULT START ---";
+                const endMarker = "--- CFC RESULT END ---";
+                const sIdx = result.output.indexOf(startMarker);
+                const eIdx = result.output.indexOf(endMarker);
+                if (sIdx !== -1 && eIdx !== -1 && sIdx < eIdx) {
+                    details = result.output.substring(sIdx, eIdx + endMarker.length);
+                }
+                const isError = !scriptSucceeded || (errorCount !== null && errorCount > 0) || (addedCount !== null && addedCount < 1);
+                let message: string;
+                if (addedCount !== null) {
+                    const verify = verifyMatch ? ` Verify: box=${verifyMatch[1]}, instance=${verifyMatch[2]}.` : "";
+                    message = isError
+                        ? `cfc_add_device FAILED for '${newName}': ${errorCount ?? '?'} error(s), added=${addedCount}.${verify}`
+                        : `Device '${newName}' (instance ${newInstance}) added as CFC: ${errorCount ?? 0} error(s), ${warningCount ?? 0} warning(s).${verify} Project saved.`;
+                    if (details) message += `\n\n${details}`;
+                } else {
+                    message = scriptSucceeded
+                        ? `cfc_add_device completed but results could not be parsed. Output:\n${result.output}`
+                        : `cfc_add_device failed. Output:\n${result.output}`;
+                }
+                return { content: [{ type: "text", text: message }], isError: isError };
+            } catch (e:any) {
+                console.error(`Error cfc_add_device: ${e}`);
                 return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
             }
         }
