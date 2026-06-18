@@ -1185,6 +1185,7 @@ INSTANCE_TYPE = "{INSTANCE_TYPE}"
 TARGET_FOLDER = "{TARGET_FOLDER}"
 GVL_NAME = "{GVL_NAME}"
 INTERLOCK = "{INTERLOCK}"
+REBIND = {REBIND}
 DO_BUILD = {DO_BUILD}
 
 def _find_value(text, pat):
@@ -1216,6 +1217,11 @@ try:
     xml = xml.replace(">" + old_name + "<", ">" + NEW_NAME + "<")
     xml = xml.replace("PROGRAM " + old_name, "PROGRAM " + NEW_NAME)
     xml = xml.replace('<Single Name="Operand" Type="string">' + old_inst + '</Single>', '<Single Name="Operand" Type="string">' + NEW_INSTANCE + '</Single>')
+    # extra operand rebinds (e.g. a controller's driven actuator Y103=Y5)
+    for rb in REBIND:
+        if "=" in rb:
+            a, b = rb.split("=", 1)
+            xml = xml.replace('<Single Name="Operand" Type="string">' + a.strip() + '</Single>', '<Single Name="Operand" Type="string">' + b.strip() + '</Single>')
     if INTERLOCK:
         xml = xml.replace('<Single Name="Operand" Type="string">FALSE</Single>', '<Single Name="Operand" Type="string">' + INTERLOCK + '</Single>', 1)
     gm = re.search('<Single Name="Guid" Type="System.Guid">([^<]+)</Single>', xml)
@@ -1954,10 +1960,11 @@ finally:
             targetFolder: z.string().optional().describe("Folder to import the program into. Defaults to 'CFCs'."),
             gvlName: z.string().optional().describe("Global variable list to declare the instance in. Defaults to 'GVL'."),
             interlock: z.string().optional().describe("Optional operand for the first lock input (e.g. 'L104.SL'). If omitted, the template's value is kept."),
+            rebind: z.array(z.string()).optional().describe("Extra operand rebinds, each as 'old=new' (e.g. for a controller's driven actuator: 'Y103=Y5'). Applied to box operand values after the instance rebind."),
             build: z.boolean().optional().describe("Build the application and report errors afterwards. Defaults to true.")
         },
         async (args) => { // Handler
-            const { projectFilePath, templatePath, newName, newInstance, instanceType, targetFolder, gvlName, interlock, build } = args;
+            const { projectFilePath, templatePath, newName, newInstance, instanceType, targetFolder, gvlName, interlock, rebind, build } = args;
             let absPath = path.normalize(path.isAbsolute(projectFilePath) ? projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
             let absTmpl = path.normalize(path.isAbsolute(templatePath) ? templatePath : path.join(WORKSPACE_DIR, templatePath));
             const doBuild = (build === false) ? "False" : "True";
@@ -1976,6 +1983,7 @@ finally:
                 script = script.replace("{TARGET_FOLDER}", targetFolder ?? "CFCs");
                 script = script.replace("{GVL_NAME}", gvlName ?? "GVL");
                 script = script.replace("{INTERLOCK}", interlock ?? "");
+                script = script.replace("{REBIND}", JSON.stringify(rebind ?? []));
                 script = script.replace("{DO_BUILD}", doBuild);
                 const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
                 const scriptSucceeded = result.success && result.output.includes("SCRIPT_SUCCESS");
