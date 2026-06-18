@@ -1562,6 +1562,204 @@ except Exception as e:
     print("SCRIPT_ERROR: %s\\n%s" % (e, traceback.format_exc())); sys.exit(1)
 `;
 
+    const CFC_BUILD_DEVICE_SCRIPT_TEMPLATE = `
+import sys, scriptengine as script_engine, os, uuid, tempfile, json, traceback
+${ENSURE_PROJECT_OPEN_PYTHON_SNIPPET}
+NAME = "{NAME}"
+BOX_TYPE = "{BOX_TYPE}"
+INSTANCE = "{INSTANCE}"
+INSTANCE_TYPE = "{INSTANCE_TYPE}"
+INPUTS = json.loads('''{INPUTS_JSON}''')
+OUTPUTS = json.loads('''{OUTPUTS_JSON}''')
+TARGET_FOLDER = "{TARGET_FOLDER}"
+GVL_NAME = "{GVL_NAME}"
+DECLARE_GVL = {DECLARE_GVL}
+DO_BUILD = {DO_BUILD}
+
+FLAGS = ('<Single Name="Flags" Type="{668066f2-6069-46b3-8962-8db8d13d7db2}" Method="IArchivable">'
+         '<Single Name="Flags" Type="int">0</Single>'
+         '<Single Name="Fixed" Type="bool">%s</Single>'
+         '<Single Name="Extensible" Type="bool">False</Single></Single>')
+
+def operand_block(operand, typ, oid, is_instance):
+    return ('<Single Name="Operand" Type="{c9b2f165-48a2-4a45-8326-3952d8a3d708}" Method="IArchivable">'
+            '<Single Name="Operand" Type="string">%s</Single>'
+            '<Single Name="Type" Type="string">%s</Single>'
+            '<Single Name="Comment" Type="string" /><Single Name="SymbolComment" Type="string" />'
+            '<Single Name="Address" Type="string" />' + FLAGS % 'True' +
+            '<Single Name="LValue" Type="bool">False</Single>'
+            '<Single Name="Boolean" Type="bool">False</Single>'
+            '<Single Name="IsInstance" Type="bool">%s</Single>'
+            '<Single Name="Id" Type="long">%d</Single></Single>') % (operand, typ, str(is_instance), oid)
+
+def build_device_cfc(name, box_type, instance, inputs, outputs):
+    meta_guid = str(uuid.uuid4()); sv_guid = str(uuid.uuid4())
+    next_id = 5
+    in_items = []
+    for (pn, pt, op) in inputs:
+        item_id = next_id; opnd_id = next_id + 1; next_id += 2
+        in_items.append('<Single Type="{9de7f100-1b87-424c-a62e-45b0cfc85ed2}" Method="IArchivable">'
+                        + operand_block(op, pt, opnd_id, False) +
+                        '<Single Name="Id" Type="long">%d</Single></Single>' % item_id)
+    uid = next_id
+    in_names = ''.join('<Single Type="string">%s</Single>' % p[0] for p in inputs)
+    in_types = ''.join('<Single Type="string">%s</Single>' % p[1] for p in inputs)
+    out_names = ''.join('<Single Type="string">%s</Single>' % p[0] for p in outputs)
+    out_types = ''.join('<Single Type="string">%s</Single>' % p[1] for p in outputs)
+    box = ('<Single Type="{acfc6f68-8e3a-4af5-bf81-3dd512095a46}" Method="IArchivable">'
+           '<Single Name="BoxType" Type="string">%s</Single>' % box_type +
+           '<Single Name="Instance" Type="{c9b2f165-48a2-4a45-8326-3952d8a3d708}" Method="IArchivable">'
+           '<Single Name="Operand" Type="string">%s</Single>'
+           '<Single Name="Type" Type="string">%s</Single>'
+           '<Single Name="Comment" Type="string" /><Single Name="SymbolComment" Type="string" />'
+           '<Single Name="Address" Type="string" />' % (instance, box_type) + FLAGS % 'False' +
+           '<Single Name="LValue" Type="bool">False</Single><Single Name="Boolean" Type="bool">False</Single>'
+           '<Single Name="IsInstance" Type="bool">True</Single><Single Name="Id" Type="long">3</Single></Single>'
+           '<Single Name="OutputItems" Type="{f40d3e09-c02c-4522-a88c-dac23558cfc4}" Method="IArchivable">'
+           '<List2 Name="OutputItems"><Null /></List2></Single>' + FLAGS % 'True' +
+           '<Null Name="InputFlags" /><List2 Name="InputItems">' + ''.join(in_items) + '</List2>'
+           '<Single Name="InputParam" Type="{71496971-9e0c-4677-a832-b9583b571130}" Method="IArchivable">'
+           '<List2 Name="Names">' + in_names + '</List2><List2 Name="Types">' + in_types + '</List2></Single>'
+           '<Single Name="OutputParam" Type="{71496971-9e0c-4677-a832-b9583b571130}" Method="IArchivable">'
+           '<List2 Name="Names">' + out_names + '</List2><List2 Name="Types">' + out_types + '</List2></Single>'
+           '<Single Name="CallType" Type="{bffb3c53-f105-4e85-aba2-e30df579d75f}">FunctionBlock</Single>'
+           '<Null Name="EN" /><Null Name="ENO" /><Null Name="STSnippet" />'
+           '<Single Name="ContainsExtensibleInputs" Type="bool">False</Single>'
+           '<Single Name="ProvidesSTSnippet" Type="bool">False</Single>'
+           '<Single Name="Id" Type="long">4</Single></Single>')
+    network = ('<Single Type="{d9a99d73-b633-47db-b876-a752acb25871}" Method="IArchivable">'
+               '<Single Name="ILActive" Type="bool">False</Single><Single Name="FBDValid" Type="bool">False</Single>'
+               '<Single Name="ILValid" Type="bool">False</Single><List2 Name="ILLines" />'
+               '<Single Name="Comment" Type="string" /><Single Name="Title" Type="string" />'
+               '<Single Name="Label" Type="string" /><Single Name="OutCommented" Type="bool">False</Single>'
+               '<List2 Name="NetworkItems">' + box + '</List2><List2 Name="Connectors" />'
+               '<Single Name="Id" Type="long">2</Single></Single>')
+    return ('<ExportFile><StructuredView Guid="{%s}">' % sv_guid +
+        '<Single xml:space="preserve" Type="{3daac5e4-660e-42e4-9cea-3711b98bfb63}" Method="IArchivable">'
+        '<Null Name="Profile" /><List2 Name="EntryList">'
+        '<Single Type="{6198ad31-4b98-445c-927f-3258a0e82fe3}" Method="IArchivable">'
+        '<Single Name="IsRoot" Type="bool">True</Single>'
+        '<Single Name="MetaObject" Type="{81297157-7ec9-45ce-845e-84cab2b88ade}" Method="IArchivable">'
+        '<Single Name="Guid" Type="System.Guid">%s</Single>' % meta_guid +
+        '<Single Name="ParentGuid" Type="System.Guid">5821422e-b860-4b0b-bfa1-90c759caf2ea</Single>'
+        '<Single Name="Name" Type="string">%s</Single>' % name +
+        '<Dictionary Type="{2c41fa04-1834-41c1-816e-303c7aa2c05b}" Name="Properties">'
+        '<Entry><Key><Single Type="System.Guid">24568a24-c491-472c-a21f-ee5d33859fab</Single></Key>'
+        '<Value><Single Type="{24568a24-c491-472c-a21f-ee5d33859fab}" Method="IArchivable">'
+        '<Single Name="MemoryReserveForOnlineChange" Type="int">0</Single>'
+        '<Single Name="ExcludeFromBuild" Type="bool">False</Single>'
+        '<Single Name="External" Type="bool">False</Single>'
+        '<Single Name="EnableSystemCall" Type="bool">False</Single>'
+        '<Single Name="CompilerDefines" Type="string" /><Single Name="LinkAlways" Type="bool">False</Single>'
+        '<Array Name="Undefines" Type="string" /></Single></Value></Entry></Dictionary>'
+        '<Single Name="TypeGuid" Type="System.Guid">6f9dac99-8de1-4efc-8465-68ac443b7d08</Single>'
+        '<Array Name="EmbeddedTypeGuids" Type="System.Guid">'
+        '<Single Type="System.Guid">a9ed5b7e-75c5-4651-af16-d2c27e98cb94</Single>'
+        '<Single Type="System.Guid">25e509de-33d4-4447-93f8-c9e4ea381c8b</Single></Array>'
+        '<Single Name="Timestamp" Type="long">637870852889073338</Single></Single>'
+        '<Single Name="Object" Type="{6f9dac99-8de1-4efc-8465-68ac443b7d08}" Method="IArchivable">'
+        '<Single Name="SpecialFunc" Type="{0db3d7bb-cde0-4416-9a7b-ce49a0124323}">None</Single>'
+        '<Single Name="Implementation" Type="{25e509de-33d4-4447-93f8-c9e4ea381c8b}" Method="IArchivable">'
+        '<Single Name="NetworkListComment" Type="string" /><Single Name="DefaultViewMode" Type="string">Fbd</Single>'
+        '<List2 Name="NetworkList">' + network + '</List2>'
+        '<Single Name="BranchCounter" Type="int">1</Single><Single Name="ValidIds" Type="bool">True</Single></Single>'
+        '<Single Name="Interface" Type="{a9ed5b7e-75c5-4651-af16-d2c27e98cb94}" Method="IArchivable">'
+        '<Single Name="TextDocument" Type="{f3878285-8e4f-490b-bb1b-9acbb7eb04db}" Method="IArchivable">'
+        '<Single Name="TextBlobForSerialisation" Type="string">PROGRAM %s%s</Single>' % (name, chr(10)) +
+        '<Single Name="LineInfoPersistence" Type="string">85f4ce70-1cb5-40e6-b789-431475238748_Decl_LineIds</Single>'
+        '</Single></Single><Single Name="UniqueIdGenerator" Type="string">%d</Single>' % uid +
+        '<Single Name="POULevel" Type="{8e575c5b-1d37-49c6-941b-5c0ec7874787}">Standard</Single>'
+        '<List Name="ChildObjectGuids" Type="System.Collections.ArrayList" />'
+        '<Single Name="AddAttributeSubsequent" Type="bool">False</Single></Single>'
+        '<Single Name="ParentSVNodeGuid" Type="System.Guid">65906c51-42fe-4a26-a9f5-71a08369fa00</Single>'
+        '<Array Name="Path" Type="string"><Single Type="string">CODESYS_Control_Win_V3</Single>'
+        '<Single Type="string">SPS-Logik</Single><Single Type="string">Application</Single>'
+        '<Single Type="string">CFCs</Single></Array><Single Name="Index" Type="int">-1</Single></Single>'
+        '</List2><Null Name="ProfileName" /></Single></StructuredView></ExportFile>')
+
+try:
+    primary_project = ensure_project_open(PROJECT_FILE_PATH)
+    itype = INSTANCE_TYPE if INSTANCE_TYPE else BOX_TYPE
+    ins = [(i["pin"], i["type"], i.get("operand", "")) for i in INPUTS]
+    outs = [(o["pin"], o["type"]) for o in OUTPUTS]
+    xml = build_device_cfc(NAME, BOX_TYPE, INSTANCE, ins, outs)
+    gen_path = os.path.join(tempfile.gettempdir(), NAME + "_build.export")
+    g = open(gen_path, "w"); g.write(xml); g.close()
+
+    app = primary_project.active_application or (primary_project.find("Application", True) or [None])[0]
+    gvl_changed = False
+    if DECLARE_GVL and INSTANCE:
+        gvl = None
+        for c in primary_project.get_children(True):
+            try:
+                if c.get_name() == GVL_NAME and getattr(c, "has_textual_declaration", False):
+                    gvl = c; break
+            except Exception: pass
+        if gvl is not None:
+            decl = gvl.textual_declaration.text
+            if (INSTANCE + ":") not in decl.replace(" ", "").replace(chr(9), ""):
+                idx = decl.rfind("END_VAR")
+                if idx != -1:
+                    gvl.textual_declaration.replace(decl[:idx] + chr(9) + INSTANCE + " : " + itype + ";" + chr(10) + decl[idx:])
+                    gvl_changed = True
+
+    for o in list(primary_project.find(NAME, True)):
+        try: o.remove()
+        except Exception: pass
+    folder = None
+    for c in primary_project.get_children(True):
+        try:
+            if c.get_name() == TARGET_FOLDER and getattr(c, "is_folder", False):
+                folder = c; break
+        except Exception: pass
+    if folder is None: folder = app
+    folder.import_native([gen_path])
+    objs = list(primary_project.find(NAME, True))
+    added = len(objs)
+
+    has_box = False; has_inst = False
+    if objs:
+        reexp = os.path.join(tempfile.gettempdir(), NAME + "_build_re.export")
+        primary_project.export_native([objs[0]], reexp, recursive=True)
+        rf = open(reexp, "r"); rx = rf.read(); rf.close()
+        has_box = BOX_TYPE in rx
+        has_inst = ('<Single Name="Operand" Type="string">' + INSTANCE + '</Single>') in rx if INSTANCE else True
+    primary_project.save()
+
+    errors = 0; warnings = 0; messages_read = False
+    if DO_BUILD and app is not None and hasattr(app, "build"):
+        app.build()
+        try:
+            _sys = None
+            try: _sys = system
+            except NameError: _sys = getattr(script_engine, "system", None)
+            sev_enum = getattr(script_engine, "Severity", None)
+            if _sys is not None and sev_enum is not None:
+                for cat in _sys.get_message_categories(True):
+                    cid = str(cat)
+                    for sev in [sev_enum.FatalError, sev_enum.Error]:
+                        for m in _sys.get_message_objects(category=cid, severities=sev): errors += 1
+                    for m in _sys.get_message_objects(category=cid, severities=sev_enum.Warning): warnings += 1
+                messages_read = True
+        except Exception as msg_err:
+            print("WARN: build message read failed: %s" % msg_err)
+
+    print("--- CFC RESULT START ---")
+    print("Added: %d" % added)
+    print("Errors: %d" % errors)
+    print("Warnings: %d" % warnings)
+    print("Verify: box=%s instance=%s" % (has_box, has_inst))
+    print("GvlChanged: %s" % gvl_changed)
+    print("--- CFC RESULT END ---")
+    if added < 1:
+        print("SCRIPT_ERROR: device program '%s' was not created." % NAME); sys.exit(1)
+    if DO_BUILD and messages_read and errors > 0:
+        print("SCRIPT_ERROR: build failed with %d error(s)." % errors); sys.exit(1)
+    print("SCRIPT_SUCCESS: device '%s' synthesized." % NAME); sys.exit(0)
+except Exception as e:
+    print("SCRIPT_ERROR: %s\\n%s" % (e, traceback.format_exc())); sys.exit(1)
+`;
+
     // --- End Python Script Templates ---
 
     // --- Zod Schemas (moved for clarity before usage) ---
@@ -2327,6 +2525,76 @@ except Exception as e:
                 return { content: [{ type: "text", text: message }], isError: isError };
             } catch (e:any) {
                 console.error(`Error set_orchestrator ${absPath}: ${e}`);
+                return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
+            }
+        }
+    );
+    server.tool(
+        "cfc_build_device", // Tool Name
+        "Synthesizes a new device control program (CFC/FBD) FROM A SPEC (no template file): one FB box of the given catalog type, bound to a global instance, with the given input pins (each wired to an operand/variable/literal) and output pins. Auto-declares the instance in the GVL, imports into CFCs, builds and verifies. Use when no template export exists or for arbitrary pin configurations. (Single-box device pattern; for connected multi-box logic use a template/native graft.)", // Description
+        { // Input Schema
+            projectFilePath: z.string().describe("Path to the .project file."),
+            name: z.string().describe("Name of the new device program, e.g. 'NS_N1'."),
+            boxType: z.string().describe("Catalog FB type for the box, e.g. 'TYP_IDF1', 'TYP_AIN', 'TYP_2PT'."),
+            instance: z.string().describe("Global FB instance name to call/bind, e.g. 'N1'."),
+            inputs: z.array(z.object({
+                pin: z.string().describe("Input pin name, e.g. 'Lock1', 'X_W'."),
+                type: z.string().describe("Pin data type, e.g. 'BOOL', 'INT'."),
+                operand: z.string().describe("Operand wired to the pin: a variable ('L104.SL'), literal ('80'/'FALSE'), or '' to leave open.")
+            })).describe("Input pins to wire. Unconnected pins may be omitted."),
+            outputs: z.array(z.object({
+                pin: z.string().describe("Output pin name, e.g. 'OUT1'."),
+                type: z.string().describe("Pin data type, e.g. 'BOOL'.")
+            })).optional().describe("Output pins to expose. Optional."),
+            instanceType: z.string().optional().describe("FB type for the GVL declaration. Defaults to boxType."),
+            targetFolder: z.string().optional().describe("Folder to import into. Defaults to 'CFCs'."),
+            gvlName: z.string().optional().describe("GVL to declare the instance in. Defaults to 'GVL'."),
+            declareInGvl: z.boolean().optional().describe("Declare the instance in the GVL if missing. Defaults to true."),
+            build: z.boolean().optional().describe("Build and verify afterwards. Defaults to true.")
+        },
+        async (args) => { // Handler
+            const { projectFilePath, name, boxType, instance, inputs, outputs, instanceType, targetFolder, gvlName, declareInGvl, build } = args;
+            let absPath = path.normalize(path.isAbsolute(projectFilePath) ? projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+            const doBuild = (build === false) ? "False" : "True";
+            const doDeclare = (declareInGvl === false) ? "False" : "True";
+            console.error(`Tool call: cfc_build_device: ${name} (${boxType}/${instance}) -> ${absPath}`);
+            try {
+                const escProj = absPath.replace(/\\/g, '\\\\');
+                let script = CFC_BUILD_DEVICE_SCRIPT_TEMPLATE.replace("{PROJECT_FILE_PATH}", escProj);
+                script = script.replace("{NAME}", name);
+                script = script.replace("{BOX_TYPE}", boxType);
+                script = script.replace("{INSTANCE}", instance);
+                script = script.replace("{INSTANCE_TYPE}", instanceType ?? "");
+                script = script.replace("{INPUTS_JSON}", JSON.stringify(inputs ?? []));
+                script = script.replace("{OUTPUTS_JSON}", JSON.stringify(outputs ?? []));
+                script = script.replace("{TARGET_FOLDER}", targetFolder ?? "CFCs");
+                script = script.replace("{GVL_NAME}", gvlName ?? "GVL");
+                script = script.replace("{DECLARE_GVL}", doDeclare);
+                script = script.replace("{DO_BUILD}", doBuild);
+                const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
+                const scriptSucceeded = result.success && result.output.includes("SCRIPT_SUCCESS");
+                const addedMatch = result.output.match(/Added:\s*(\d+)/);
+                const errMatch = result.output.match(/Errors:\s*(\d+)/);
+                const warnMatch = result.output.match(/Warnings:\s*(\d+)/);
+                const verifyMatch = result.output.match(/Verify:\s*box=(\w+)\s+instance=(\w+)/);
+                const addedCount: number | null = addedMatch ? parseInt(addedMatch[1], 10) : null;
+                const errorCount: number | null = errMatch ? parseInt(errMatch[1], 10) : null;
+                const warningCount: number | null = warnMatch ? parseInt(warnMatch[1], 10) : null;
+                const isError = !scriptSucceeded || (errorCount !== null && errorCount > 0) || (addedCount !== null && addedCount < 1);
+                let message: string;
+                if (addedCount !== null) {
+                    const verify = verifyMatch ? ` Verify: box=${verifyMatch[1]}, instance=${verifyMatch[2]}.` : "";
+                    message = isError
+                        ? `cfc_build_device FAILED for '${name}': ${errorCount ?? '?'} error(s), added=${addedCount}.${verify}`
+                        : `Device '${name}' (${boxType}/${instance}) synthesized as CFC: ${errorCount ?? 0} error(s), ${warningCount ?? 0} warning(s).${verify} Project saved.`;
+                } else {
+                    message = scriptSucceeded
+                        ? `cfc_build_device completed but results could not be parsed. Output:\n${result.output}`
+                        : `cfc_build_device failed. Output:\n${result.output}`;
+                }
+                return { content: [{ type: "text", text: message }], isError: isError };
+            } catch (e:any) {
+                console.error(`Error cfc_build_device: ${e}`);
                 return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
             }
         }
