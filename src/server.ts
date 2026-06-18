@@ -1177,7 +1177,7 @@ except Exception as e:
 `;
 
     const CFC_ADD_DEVICE_SCRIPT_TEMPLATE = `
-import sys, scriptengine as script_engine, os, re, uuid, traceback
+import sys, scriptengine as script_engine, os, re, uuid, tempfile, traceback
 ${ENSURE_PROJECT_OPEN_PYTHON_SNIPPET}
 TEMPLATE_PATH = r"{TEMPLATE_PATH}"
 NEW_NAME = "{NEW_NAME}"
@@ -1229,7 +1229,7 @@ try:
     if gm:
         xml = xml[:gm.start(1)] + str(uuid.uuid4()) + xml[gm.end(1):]
 
-    gen_path = os.path.join(os.path.dirname(TEMPLATE_PATH), NEW_NAME + "_gen.export")
+    gen_path = os.path.join(tempfile.gettempdir(), NEW_NAME + "_gen.export")
     g = open(gen_path, "w"); g.write(xml); g.close()
 
     app = primary_project.active_application
@@ -1276,7 +1276,7 @@ try:
     # --- round-trip verification ---
     has_box = False; has_inst = False
     if objs:
-        reexp = os.path.join(os.path.dirname(TEMPLATE_PATH), NEW_NAME + "_reexport.export")
+        reexp = os.path.join(tempfile.gettempdir(), NEW_NAME + "_reexport.export")
         primary_project.export_native([objs[0]], reexp, recursive=True)
         rf = open(reexp, "r"); rx = rf.read(); rf.close()
         has_box = (box_type in rx) if box_type else False
