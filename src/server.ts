@@ -580,6 +580,8 @@ ${FIND_OBJECT_BY_PATH_PYTHON_SNIPPET}
 POU_FULL_PATH = "{POU_FULL_PATH}" # Expecting format like "Application/MyPOU" or "Folder/SubFolder/MyPOU"
 DECLARATION_CONTENT = """{DECLARATION_CONTENT}"""
 IMPLEMENTATION_CONTENT = """{IMPLEMENTATION_CONTENT}"""
+SET_DECL = {SET_DECL}
+SET_IMPL = {SET_IMPL}
 
 try:
     print("DEBUG: set_pou_code script: POU_FULL_PATH='%s', Project='%s'" % (POU_FULL_PATH, PROJECT_FILE_PATH))
@@ -595,9 +597,9 @@ try:
 
     # --- Set Declaration Part ---
     declaration_updated = False
-    # Check if the content is actually provided (might be None/empty if only impl is set)
-    has_declaration_content = 'DECLARATION_CONTENT' in locals() or 'DECLARATION_CONTENT' in globals()
-    if has_declaration_content and DECLARATION_CONTENT is not None: # Check not None
+    # Only touch the declaration when the caller actually provided declarationCode.
+    # (An omitted declaration must NOT be replaced with "" — that would wipe e.g. 'PROGRAM PLC_PRG'.)
+    if SET_DECL:
         if hasattr(target_object, 'textual_declaration'):
             decl_obj = target_object.textual_declaration
             if decl_obj and hasattr(decl_obj, 'replace'):
@@ -619,8 +621,7 @@ try:
 
     # --- Set Implementation Part ---
     implementation_updated = False
-    has_implementation_content = 'IMPLEMENTATION_CONTENT' in locals() or 'IMPLEMENTATION_CONTENT' in globals()
-    if has_implementation_content and IMPLEMENTATION_CONTENT is not None: # Check not None
+    if SET_IMPL:
         if hasattr(target_object, 'textual_implementation'):
             impl_obj = target_object.textual_implementation
             if impl_obj and hasattr(impl_obj, 'replace'):
@@ -1508,6 +1509,59 @@ except Exception as e:
     print("SCRIPT_ERROR: %s\\n%s" % (e, traceback.format_exc())); sys.exit(1)
 `;
 
+    const SET_ORCHESTRATOR_SCRIPT_TEMPLATE = `
+import sys, scriptengine as script_engine, os, traceback
+${ENSURE_PROJECT_OPEN_PYTHON_SNIPPET}
+POU_NAME = "{POU_NAME}"
+CALLS = {CALLS}
+DO_BUILD = {DO_BUILD}
+
+try:
+    primary_project = ensure_project_open(PROJECT_FILE_PATH)
+    target = None
+    for o in primary_project.find(POU_NAME, True):
+        if not getattr(o, "is_device", False) and getattr(o, "has_textual_implementation", False):
+            target = o; break
+    if target is None:
+        raise RuntimeError("Orchestrator POU '%s' not found." % POU_NAME)
+    # set ONLY the implementation (never the declaration) -> task binding stays intact
+    body = (chr(10)).join([str(c).strip() + "();" for c in CALLS if str(c).strip()])
+    target.textual_implementation.replace(body)
+    primary_project.save()
+
+    app = primary_project.active_application or (primary_project.find("Application", True) or [None])[0]
+    errors = 0; warnings = 0; messages_read = False
+    if DO_BUILD and app is not None and hasattr(app, "build"):
+        app.build()
+        try:
+            _sys = None
+            try: _sys = system
+            except NameError: _sys = getattr(script_engine, "system", None)
+            sev_enum = getattr(script_engine, "Severity", None)
+            if _sys is not None and sev_enum is not None:
+                for cat in _sys.get_message_categories(True):
+                    cid = str(cat)
+                    for sev in [sev_enum.FatalError, sev_enum.Error]:
+                        for m in _sys.get_message_objects(category=cid, severities=sev): errors += 1
+                    for m in _sys.get_message_objects(category=cid, severities=sev_enum.Warning): warnings += 1
+                messages_read = True
+        except Exception as msg_err:
+            print("WARN: build message read failed: %s" % msg_err)
+
+    ncalls = len([c for c in CALLS if str(c).strip()])
+    print("--- ORCH RESULT START ---")
+    print("POU: %s" % POU_NAME)
+    print("Calls: %d" % ncalls)
+    print("Errors: %d" % errors)
+    print("Warnings: %d" % warnings)
+    print("--- ORCH RESULT END ---")
+    if DO_BUILD and messages_read and errors > 0:
+        print("SCRIPT_ERROR: orchestrator build failed with %d error(s)." % errors); sys.exit(1)
+    print("SCRIPT_SUCCESS: orchestrator %s set with %d call(s)." % (POU_NAME, ncalls)); sys.exit(0)
+except Exception as e:
+    print("SCRIPT_ERROR: %s\\n%s" % (e, traceback.format_exc())); sys.exit(1)
+`;
+
     // --- End Python Script Templates ---
 
     // --- Zod Schemas (moved for clarity before usage) ---
@@ -1791,6 +1845,8 @@ except Exception as e:
                 script = script.replace("{POU_FULL_PATH}", sanPouPath);
                 script = script.replace("{DECLARATION_CONTENT}", sanDeclCode);
                 script = script.replace("{IMPLEMENTATION_CONTENT}", sanImplCode);
+                script = script.replace("{SET_DECL}", declarationCode !== undefined ? "True" : "False");
+                script = script.replace("{SET_IMPL}", implementationCode !== undefined ? "True" : "False");
 
                 console.error(">>> set_pou_code: PREPARED SCRIPT:", script.substring(0, 500) + "...");
                 const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
@@ -2225,6 +2281,52 @@ except Exception as e:
                 return { content: [{ type: "text", text: message }], isError: isError };
             } catch (e:any) {
                 console.error(`Error scaffold_plant ${absPath}: ${e}`);
+                return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
+            }
+        }
+    );
+    server.tool(
+        "set_orchestrator", // Tool Name
+        "Sets the body of the task-bound orchestrator program (PLC_PRG by default) to call the given device/sub-programs in order, e.g. ['NS_N1','YS_Y1'] becomes 'NS_N1();' + 'YS_Y1();'. Sets ONLY the implementation, never the declaration, so the task binding stays intact (avoids the 'PLC_PRG nicht definiert' breakage). Optionally builds and verifies.", // Description
+        { // Input Schema
+            projectFilePath: z.string().describe("Path to the .project file."),
+            calls: z.array(z.string()).describe("Program names to call in order (without parentheses), e.g. ['NS_N1','YS_Y1','AI_A1']."),
+            pouName: z.string().optional().describe("Name of the orchestrator POU. Defaults to 'PLC_PRG'."),
+            build: z.boolean().optional().describe("Build and verify afterwards. Defaults to true.")
+        },
+        async (args) => { // Handler
+            const { projectFilePath, calls, pouName, build } = args;
+            let absPath = path.normalize(path.isAbsolute(projectFilePath) ? projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+            const doBuild = (build === false) ? "False" : "True";
+            console.error(`Tool call: set_orchestrator: ${absPath} pou=${pouName ?? 'PLC_PRG'} calls=${JSON.stringify(calls)}`);
+            try {
+                const escProj = absPath.replace(/\\/g, '\\\\');
+                let script = SET_ORCHESTRATOR_SCRIPT_TEMPLATE.replace("{PROJECT_FILE_PATH}", escProj);
+                script = script.replace("{POU_NAME}", pouName ?? "PLC_PRG");
+                script = script.replace("{CALLS}", JSON.stringify(calls ?? []));
+                script = script.replace("{DO_BUILD}", doBuild);
+                const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
+                const scriptSucceeded = result.success && result.output.includes("SCRIPT_SUCCESS");
+                const callsMatch = result.output.match(/Calls:\s*(\d+)/);
+                const errMatch = result.output.match(/Errors:\s*(\d+)/);
+                const warnMatch = result.output.match(/Warnings:\s*(\d+)/);
+                const callCount = callsMatch ? parseInt(callsMatch[1], 10) : null;
+                const errorCount: number | null = errMatch ? parseInt(errMatch[1], 10) : null;
+                const warningCount: number | null = warnMatch ? parseInt(warnMatch[1], 10) : null;
+                const isError = !scriptSucceeded || (errorCount !== null && errorCount > 0);
+                let message: string;
+                if (errorCount !== null) {
+                    message = isError
+                        ? `set_orchestrator FAILED for ${absPath}: ${errorCount} error(s).`
+                        : `Orchestrator '${pouName ?? 'PLC_PRG'}' set with ${callCount ?? '?'} call(s): builds with ${errorCount} error(s), ${warningCount ?? 0} warning(s).`;
+                } else {
+                    message = scriptSucceeded
+                        ? `Orchestrator set (build skipped/unparsed). Output:\n${result.output}`
+                        : `set_orchestrator failed for ${absPath}. Output:\n${result.output}`;
+                }
+                return { content: [{ type: "text", text: message }], isError: isError };
+            } catch (e:any) {
+                console.error(`Error set_orchestrator ${absPath}: ${e}`);
                 return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
             }
         }
