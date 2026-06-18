@@ -1447,6 +1447,67 @@ finally:
     except Exception: pass
 `;
 
+    const SCAFFOLD_PLANT_SCRIPT_TEMPLATE = `
+import sys, scriptengine as script_engine, os, shutil, traceback
+${ENSURE_PROJECT_OPEN_PYTHON_SNIPPET}
+SKELETON_PATH = r"{SKELETON_PATH}"
+OVERWRITE = {OVERWRITE}
+DO_BUILD = {DO_BUILD}
+
+try:
+    SKELETON_PATH = os.path.normpath(SKELETON_PATH)
+    if not os.path.exists(SKELETON_PATH):
+        raise IOError("Skeleton project not found: %s" % SKELETON_PATH)
+    target = os.path.normpath(PROJECT_FILE_PATH)
+    if os.path.normcase(os.path.abspath(target)) == os.path.normcase(os.path.abspath(SKELETON_PATH)):
+        raise ValueError("Target path equals skeleton path.")
+    if os.path.exists(target) and not OVERWRITE:
+        raise IOError("Target already exists (set overwrite=true to replace): %s" % target)
+    tdir = os.path.dirname(target)
+    if tdir and not os.path.exists(tdir):
+        os.makedirs(tdir)
+    shutil.copy(SKELETON_PATH, target)
+    print("DEBUG: scaffold: copied skeleton -> %s" % target)
+
+    primary_project = ensure_project_open(target)
+    app = primary_project.active_application or (primary_project.find("Application", True) or [None])[0]
+
+    errors = 0; warnings = 0; messages_read = False
+    if DO_BUILD and app is not None and hasattr(app, "build"):
+        app.build()
+        try:
+            _sys = None
+            try: _sys = system
+            except NameError: _sys = getattr(script_engine, "system", None)
+            sev_enum = getattr(script_engine, "Severity", None)
+            if _sys is not None and sev_enum is not None:
+                for cat in _sys.get_message_categories(True):
+                    cid = str(cat)
+                    for sev in [sev_enum.FatalError, sev_enum.Error]:
+                        for m in _sys.get_message_objects(category=cid, severities=sev): errors += 1
+                    for m in _sys.get_message_objects(category=cid, severities=sev_enum.Warning): warnings += 1
+                messages_read = True
+        except Exception as msg_err:
+            print("WARN: build message read failed: %s" % msg_err)
+
+    have = []
+    for nm in ["GVL", "CFCs", "SFCs", "PLC_PRG"]:
+        have.append("%s=%s" % (nm, len(list(primary_project.find(nm, True))) > 0))
+    primary_project.save()
+
+    print("--- SCAFFOLD RESULT START ---")
+    print("Errors: %d" % errors)
+    print("Warnings: %d" % warnings)
+    print("Structure: %s" % ", ".join(have))
+    print("--- SCAFFOLD RESULT END ---")
+
+    if DO_BUILD and messages_read and errors > 0:
+        print("SCRIPT_ERROR: scaffold build failed with %d error(s)." % errors); sys.exit(1)
+    print("SCRIPT_SUCCESS: plant scaffolded at %s." % target); sys.exit(0)
+except Exception as e:
+    print("SCRIPT_ERROR: %s\\n%s" % (e, traceback.format_exc())); sys.exit(1)
+`;
+
     // --- End Python Script Templates ---
 
     // --- Zod Schemas (moved for clarity before usage) ---
@@ -2112,6 +2173,58 @@ finally:
                 return { content: [{ type: "text", text: message }], isError: isError };
             } catch (e:any) {
                 console.error(`Error sim_run ${absPath}: ${e}`);
+                return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
+            }
+        }
+    );
+    server.tool(
+        "scaffold_plant", // Tool Name
+        "Scaffolds a new CODESYS plant project by cloning a known-good skeleton (retargeted device, referenced catalog library, empty GVL, CFCs/SFCs folders, task-bound PLC_PRG orchestrator), then builds and verifies it. The result is a buildable project ready to fill with cfc_add_device. Use this to start a project from scratch.", // Description
+        { // Input Schema
+            projectFilePath: z.string().describe("Path for the NEW project to create (e.g. 'C:/Projects/Beer.project')."),
+            skeletonPath: z.string().describe("Path to the skeleton .project to clone (the prepared base; e.g. the bundle's skeleton/skeleton.project)."),
+            overwrite: z.boolean().optional().describe("If true, replace an existing project at projectFilePath. Defaults to false."),
+            build: z.boolean().optional().describe("Build and verify the scaffolded project. Defaults to true.")
+        },
+        async (args) => { // Handler
+            const { projectFilePath, skeletonPath, overwrite, build } = args;
+            let absPath = path.normalize(path.isAbsolute(projectFilePath) ? projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+            let absSkel = path.normalize(path.isAbsolute(skeletonPath) ? skeletonPath : path.join(WORKSPACE_DIR, skeletonPath));
+            const doBuild = (build === false) ? "False" : "True";
+            const doOverwrite = overwrite ? "True" : "False";
+            console.error(`Tool call: scaffold_plant: target='${absPath}', skeleton='${absSkel}'`);
+            try {
+                if (!(await fileExists(absSkel))) {
+                    return { content: [{ type: "text", text: `Error: skeleton project not found: ${absSkel}` }], isError: true };
+                }
+                const escTarget = absPath.replace(/\\/g, '\\\\');
+                const escSkel = absSkel.replace(/\\/g, '\\\\');
+                let script = SCAFFOLD_PLANT_SCRIPT_TEMPLATE.replace("{PROJECT_FILE_PATH}", escTarget);
+                script = script.replace("{SKELETON_PATH}", escSkel);
+                script = script.replace("{OVERWRITE}", doOverwrite);
+                script = script.replace("{DO_BUILD}", doBuild);
+                const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
+                const scriptSucceeded = result.success && result.output.includes("SCRIPT_SUCCESS");
+                const errMatch = result.output.match(/Errors:\s*(\d+)/);
+                const warnMatch = result.output.match(/Warnings:\s*(\d+)/);
+                const structMatch = result.output.match(/Structure:\s*([^\r\n]+)/);
+                const errorCount: number | null = errMatch ? parseInt(errMatch[1], 10) : null;
+                const warningCount: number | null = warnMatch ? parseInt(warnMatch[1], 10) : null;
+                const isError = !scriptSucceeded || (errorCount !== null && errorCount > 0);
+                let message: string;
+                if (errorCount !== null) {
+                    const struct = structMatch ? ` Structure: ${structMatch[1].trim()}.` : "";
+                    message = isError
+                        ? `scaffold_plant FAILED for ${absPath}: ${errorCount} error(s), ${warningCount ?? '?'} warning(s).${struct}`
+                        : `Plant scaffolded at ${absPath}: builds with ${errorCount} error(s), ${warningCount ?? 0} warning(s).${struct} Ready for cfc_add_device.`;
+                } else {
+                    message = scriptSucceeded
+                        ? `Plant scaffolded at ${absPath} (build skipped or results unparsed). Output:\n${result.output}`
+                        : `scaffold_plant failed for ${absPath}. Output:\n${result.output}`;
+                }
+                return { content: [{ type: "text", text: message }], isError: isError };
+            } catch (e:any) {
+                console.error(`Error scaffold_plant ${absPath}: ${e}`);
                 return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
             }
         }
