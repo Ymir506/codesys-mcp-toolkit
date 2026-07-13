@@ -882,22 +882,50 @@ try:
             raise RuntimeError("Severity enum not available.")
         error_severities = [sev_enum.FatalError, sev_enum.Error]
 
-        # Only categories that received a message this session (fresh CODESYS per call).
-        active_categories = _sys.get_message_categories(True)
-        for cat in active_categories:
-            cat_id = str(cat)  # get_message_objects expects the category Guid as a string
+        # Detect compile errors headless. Plain build() does NOT emit compile errors to
+        # the scripting message store on this --runscript setup. create_boot_application()
+        # forces a full precompile of the code that enters the boot application (all
+        # referenced/reachable code) and writes errors to the fixed Build category, which
+        # we then read. NOTE: purely UNREFERENCED objects are not part of the boot app and
+        # are therefore not checked here (same scope as an actual PLC download).
+        compile_cat = None
+        try:
+            compile_cat = Guid("{97F48D64-A2A3-4856-B640-75C046E37EA9}")
+        except Exception:
             try:
-                for sev in error_severities:
-                    for m in _sys.get_message_objects(category=cat_id, severities=sev):
-                        errors += 1
-                        detail_lines.append("ERROR: %s" % _msg_text(m))
-                for m in _sys.get_message_objects(category=cat_id, severities=sev_enum.Warning):
+                from System import Guid as _Guid
+                compile_cat = _Guid("{97F48D64-A2A3-4856-B640-75C046E37EA9}")
+            except Exception as ge:
+                print("DEBUG: compile-category Guid failed: %s" % ge)
+
+        if compile_cat is not None:
+            try:
+                _sys.clear_messages(compile_cat)
+            except Exception as clr:
+                print("DEBUG: clear_messages failed: %s" % clr)
+
+        import tempfile as _tf
+        _boot = os.path.join(_tf.gettempdir(), "codesys_boot_check.app")
+        try:
+            target_app.create_boot_application(_boot)
+        except Exception as cba:
+            # NullReference is expected headless (boot-file generation needs a target);
+            # the precompile that runs first has already populated the Build category.
+            print("DEBUG: create_boot_application: %s" % cba)
+
+        if compile_cat is not None:
+            try:
+                err_mask = sev_enum.FatalError | sev_enum.Error
+                for m in _sys.get_message_objects(compile_cat, err_mask):
+                    errors += 1
+                    detail_lines.append("ERROR: %s%s: %s" % (getattr(m, 'prefix', '') or '', getattr(m, 'number', '') or '', _msg_text(m)))
+                for m in _sys.get_message_objects(compile_cat, sev_enum.Warning):
                     warnings += 1
-                    detail_lines.append("WARNING: %s" % _msg_text(m))
-            except Exception as ce:
-                query_failed = True
-                print("DEBUG: Could not read messages for category %s: %s" % (cat_id, ce))
-        messages_read = not query_failed
+                    detail_lines.append("WARNING: %s%s: %s" % (getattr(m, 'prefix', '') or '', getattr(m, 'number', '') or '', _msg_text(m)))
+                messages_read = True
+            except Exception as rderr:
+                print("DEBUG: compile-category read failed: %s" % rderr)
+                messages_read = False
     except Exception as msg_err:
         print("WARN: Could not read build messages from store: %s" % msg_err)
 
