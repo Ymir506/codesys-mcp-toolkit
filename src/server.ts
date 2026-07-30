@@ -573,6 +573,206 @@ except Exception as e:
     print(error_message); print("SCRIPT_ERROR: Error creating POU '%s': %s" % (POU_NAME, e)); sys.exit(1)
 `;
 
+    // Erzeugt eine ECHTE Global Variable List (GVL) als eigenes Objekt via
+
+    // ScriptIecLanguageObjectContainer.create_gvl(name). Behebt den Stolperstein,
+
+    // dass der Agent mangels GVL-Werkzeug bisher eine GVL faelschlich als PROGRAM
+
+    // anlegte (VAR_GLOBAL in einem Programm ist ungueltig). Optional wird die
+
+    // vollstaendige textuelle Deklaration (VAR_GLOBAL ... END_VAR) gesetzt.
+
+    const CREATE_GVL_SCRIPT_TEMPLATE = `
+
+import sys, scriptengine as script_engine, os, traceback
+
+${ENSURE_PROJECT_OPEN_PYTHON_SNIPPET}
+
+${FIND_OBJECT_BY_PATH_PYTHON_SNIPPET}
+
+GVL_NAME = "{GVL_NAME}"; PARENT_PATH_REL = "{PARENT_PATH}"
+
+DECLARATION_CONTENT = """{DECLARATION_CONTENT}"""
+
+SET_DECL = {SET_DECL}
+
+
+
+try:
+
+    print("DEBUG: create_gvl script: Name='%s', ParentPath='%s', Project='%s'" % (GVL_NAME, PARENT_PATH_REL, PROJECT_FILE_PATH))
+
+    primary_project = ensure_project_open(PROJECT_FILE_PATH)
+
+    if not GVL_NAME: raise ValueError("GVL name empty.")
+
+    if not PARENT_PATH_REL: raise ValueError("Parent path empty.")
+
+
+
+    parent_object = find_object_by_path_robust(primary_project, PARENT_PATH_REL, "parent container")
+
+    if not parent_object: raise ValueError("Parent object not found for path: %s" % PARENT_PATH_REL)
+
+    parent_name = getattr(parent_object, 'get_name', lambda: str(parent_object))()
+
+    print("DEBUG: Using parent object: %s (Type: %s)" % (parent_name, type(parent_object).__name__))
+
+
+
+    if not hasattr(parent_object, 'create_gvl'):
+
+        raise TypeError("Parent object '%s' of type %s does not support create_gvl." % (parent_name, type(parent_object).__name__))
+
+
+
+    # Idempotenz: existiert direkt unter dem Parent bereits eine GVL des Namens, wird sie wiederverwendet.
+
+    new_gvl = None
+
+    try:
+
+        for ch in parent_object.get_children(False):
+
+            if getattr(ch, 'get_name', lambda: None)() == GVL_NAME:
+
+                new_gvl = ch; print("DEBUG: GVL '%s' existiert bereits, wird wiederverwendet." % GVL_NAME); break
+
+    except Exception as scan_err:
+
+        print("DEBUG: Kind-Scan uebersprungen: %s" % scan_err)
+
+
+
+    if new_gvl is None:
+
+        print("DEBUG: Calling parent_object.create_gvl('%s')" % GVL_NAME)
+
+        new_gvl = parent_object.create_gvl(GVL_NAME)
+
+
+
+    if not new_gvl:
+
+        error_message = "Failed to create GVL '%s'. create_gvl returned None." % GVL_NAME
+
+        print(error_message); print("SCRIPT_ERROR: %s" % error_message); sys.exit(1)
+
+
+
+    gvl_name_actual = getattr(new_gvl, 'get_name', lambda: GVL_NAME)()
+
+
+
+    # Optional die vollstaendige textuelle Deklaration setzen (ganzer VAR_GLOBAL-Block).
+
+    if SET_DECL:
+
+        if hasattr(new_gvl, 'textual_declaration') and new_gvl.textual_declaration and hasattr(new_gvl.textual_declaration, 'replace'):
+
+            new_gvl.textual_declaration.replace(DECLARATION_CONTENT)
+
+            print("DEBUG: GVL-Deklaration gesetzt.")
+
+        else:
+
+            print("WARN: GVL '%s' hat keine beschreibbare textual_declaration; Deklaration uebersprungen." % gvl_name_actual)
+
+
+
+    primary_project.save()
+
+    print("GVL Created: %s" % gvl_name_actual); print("Parent Path: %s" % PARENT_PATH_REL)
+
+    print("SCRIPT_SUCCESS: GVL created successfully."); sys.exit(0)
+
+except Exception as e:
+
+    detailed_error = traceback.format_exc()
+
+    error_message = "Error creating GVL '%s' in project '%s': %s\\n%s" % (GVL_NAME, PROJECT_FILE_PATH, e, detailed_error)
+
+    print(error_message); print("SCRIPT_ERROR: Error creating GVL '%s': %s" % (GVL_NAME, e)); sys.exit(1)
+
+`;
+
+    // Fuegt dem Projekt eine Bibliotheks-Referenz hinzu (Library Manager add_library),
+    // damit Katalog-Bausteine wie TYP_IDF1/TYP_BIN/TYP_AIN aus z.B. Grundfunktionen.library
+    // aufloesen. Bibliothek wird per Name aus dem Repository geholt oder per .library-Datei
+    // installiert. Baustein fuer vorlagenfreies Scaffolding.
+    const ADD_LIBRARY_REFERENCE_SCRIPT_TEMPLATE = `
+import sys, scriptengine as script_engine, os, traceback
+${ENSURE_PROJECT_OPEN_PYTHON_SNIPPET}
+LIB_NAME = "{LIB_NAME}"
+LIB_FILEPATH = """{LIB_FILEPATH}"""
+AS_PLACEHOLDER = {AS_PLACEHOLDER}
+PLACEHOLDER_NAME = "{PLACEHOLDER_NAME}"
+
+try:
+    print("DEBUG: add_library_reference: name='%s', file='%s', project='%s'" % (LIB_NAME, LIB_FILEPATH, PROJECT_FILE_PATH))
+    primary_project = ensure_project_open(PROJECT_FILE_PATH)
+    libmgr = getattr(script_engine, 'library_manager', None)
+    if libmgr is None:
+        raise RuntimeError("scriptengine has no 'library_manager' in scope.")
+
+    # 1) ManagedLib beschaffen: erst per Name aus den Repositories, sonst per Datei installieren.
+    managed = None
+    if LIB_NAME:
+        try:
+            managed = libmgr.get_library(LIB_NAME, None)
+        except Exception as ge:
+            print("DEBUG: get_library('%s') failed: %s" % (LIB_NAME, ge))
+    if managed is None and LIB_FILEPATH:
+        if not os.path.exists(LIB_FILEPATH):
+            raise ValueError("Library file not found: %s" % LIB_FILEPATH)
+        print("DEBUG: installing library from file: %s" % LIB_FILEPATH)
+        try:
+            managed = libmgr.install_library(LIB_FILEPATH, None, False)
+        except Exception as ie:
+            print("DEBUG: install_library failed (may already be installed): %s" % ie)
+        if managed is None and LIB_NAME:
+            managed = libmgr.get_library(LIB_NAME, None)
+    if managed is None:
+        raise ValueError("Could not resolve a managed library (name='%s', file='%s'). Provide an installed libraryName or a valid libraryFilePath." % (LIB_NAME, LIB_FILEPATH))
+    disp = getattr(managed, 'displayname', LIB_NAME) or LIB_NAME
+    print("DEBUG: resolved managed library: %s" % disp)
+
+    # 2) Library-Manager-Objekt im Projekt finden (implementiert add_library/get_libraries).
+    libman = None
+    for o in primary_project.get_children(True):
+        if hasattr(o, 'add_library') and hasattr(o, 'get_libraries'):
+            libman = o; break
+    if libman is None:
+        raise RuntimeError("No Library Manager object found in project (needs an Application with a Library Manager).")
+
+    # 3) Idempotenz: schon referenziert?
+    already = False
+    try:
+        for e in list(libman.get_libraries(False)):
+            if LIB_NAME and LIB_NAME.lower() in str(e).lower():
+                already = True; break
+    except Exception as le:
+        print("DEBUG: get_libraries failed: %s" % le)
+
+    if already:
+        print("DEBUG: library '%s' already referenced; nothing to do." % LIB_NAME)
+    elif AS_PLACEHOLDER:
+        print("DEBUG: add_placeholder('%s', managed)" % (PLACEHOLDER_NAME or disp))
+        libman.add_placeholder(PLACEHOLDER_NAME or disp, managed)
+    else:
+        print("DEBUG: add_library(managed)")
+        libman.add_library(managed)
+
+    primary_project.save()
+    print("Library referenced: %s" % disp)
+    print("SCRIPT_SUCCESS: library reference added."); sys.exit(0)
+except Exception as e:
+    detailed_error = traceback.format_exc()
+    error_message = "Error add_library_reference in '%s': %s\\n%s" % (PROJECT_FILE_PATH, e, detailed_error)
+    print(error_message); print("SCRIPT_ERROR: %s" % e); sys.exit(1)
+`;
+
     const SET_POU_CODE_SCRIPT_TEMPLATE = `
 import sys, scriptengine as script_engine, os, traceback
 ${ENSURE_PROJECT_OPEN_PYTHON_SNIPPET}
@@ -2046,6 +2246,121 @@ except Exception as e:
     );
 
     server.tool(
+
+        "create_gvl", // Tool Name
+
+        "Creates a REAL Global Variable List (GVL) object under the given parent (default 'Application'), optionally setting its full textual declaration (VAR_GLOBAL ... END_VAR). Use this for global variables and catalog-instance declarations — a GVL is NOT a Program, so do NOT use create_pou for it. Reuses an existing GVL of the same name if present (idempotent).", // Tool Description
+
+        { // Input Schema
+
+            projectFilePath: z.string().describe("Path to the project file (e.g., 'C:/Projects/MyPLC.project')."),
+
+            name: z.string().describe("Name for the GVL (valid IEC identifier). Defaults to 'GVL'.").optional(),
+
+            parentPath: z.string().describe("Relative path of the container to create the GVL under (e.g. 'Application' or 'Application/GVLs'). Defaults to 'Application'.").optional(),
+
+            declaration: z.string().describe("Optional full textual declaration block, e.g. 'VAR_GLOBAL\\n\\tG1 : TYP_BIN;\\n\\tN1 : TYP_IDF1;\\nEND_VAR'. If omitted, an empty GVL is created.").optional()
+
+        },
+
+        async (args) => { // Handler
+
+            const { projectFilePath, name, parentPath, declaration } = args;
+
+            let absPath = path.normalize(path.isAbsolute(projectFilePath) ? projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+
+            const sanName = (name ?? "GVL").trim();
+
+            const sanParentPath = (parentPath ?? "Application").replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+
+            console.error(`Tool call: create_gvl: Name='${sanName}', Parent='${sanParentPath}', Project='${absPath}'`);
+
+            if (!sanName) {
+
+                return { content: [{ type: "text", text: `Error: GVL name cannot be empty.` }], isError: true };
+
+            }
+
+            try {
+
+                const escProjPath = absPath.replace(/\\/g, '\\\\');
+
+                // Escape content for Python triple-quoted string (same approach as set_pou_code).
+
+                const sanDecl = (declaration ?? "").replace(/\\/g, '\\\\').replace(/"""/g, '\\"\\"\\"');
+
+                let script = CREATE_GVL_SCRIPT_TEMPLATE.replace("{PROJECT_FILE_PATH}", escProjPath);
+
+                script = script.replace("{GVL_NAME}", sanName);
+
+                script = script.replace("{PARENT_PATH}", sanParentPath);
+
+                script = script.replace("{DECLARATION_CONTENT}", sanDecl);
+
+                script = script.replace("{SET_DECL}", declaration !== undefined ? "True" : "False");
+
+
+
+                console.error(">>> create_gvl: PREPARED SCRIPT:", script.substring(0, 500) + "...");
+
+                const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
+
+                console.error(">>> create_gvl: EXECUTION RESULT:", JSON.stringify(result));
+
+                const success = result.success && result.output.includes("SCRIPT_SUCCESS");
+
+                return { content: [{ type: "text", text: success ? `GVL '${sanName}' created under '${sanParentPath}' in ${absPath}. Project saved.` : `Failed to create GVL '${sanName}'. Output:\n${result.output}` }], isError: !success };
+
+            } catch (e:any) {
+
+                console.error(`Error create_gvl ${sanName} in ${absPath}: ${e}`);
+
+                return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
+
+            }
+
+        }
+
+    );
+
+    server.tool(
+        "add_library_reference", // Tool Name
+        "Adds a library reference to the project's Library Manager so catalog blocks resolve (e.g. TYP_IDF1/TYP_BIN/TYP_AIN from Grundfunktionen.library). Provide libraryName (a library already installed in a repository) and/or libraryFilePath (a .library file on disk, which is installed first). Idempotent: skips if already referenced. Building block for template-free scaffolding.", // Description
+        { // Input Schema
+            projectFilePath: z.string().describe("Path to the .project file."),
+            libraryName: z.string().describe("Name of the library to reference, e.g. 'Grundfunktionen'. Used to look up an already-installed library and to skip if already referenced.").optional(),
+            libraryFilePath: z.string().describe("Path to a .library file on disk. If given and the library is not found by name, it is installed into the first repository, then referenced.").optional(),
+            asPlaceholder: z.boolean().optional().describe("Add as a version placeholder instead of a fixed reference. Defaults to false."),
+            placeholderName: z.string().optional().describe("Placeholder name (defaults to the library display name) when asPlaceholder is true.")
+        },
+        async (args) => { // Handler
+            const { projectFilePath, libraryName, libraryFilePath, asPlaceholder, placeholderName } = args;
+            if (!libraryName && !libraryFilePath) {
+                return { content: [{ type: "text", text: "Error: provide libraryName and/or libraryFilePath." }], isError: true };
+            }
+            let absPath = path.normalize(path.isAbsolute(projectFilePath) ? projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+            const absLib = libraryFilePath ? path.normalize(path.isAbsolute(libraryFilePath) ? libraryFilePath : path.join(WORKSPACE_DIR, libraryFilePath)) : "";
+            console.error(`Tool call: add_library_reference: name='${libraryName ?? ''}', file='${absLib}', project='${absPath}'`);
+            try {
+                const escProj = absPath.replace(/\\/g, '\\\\');
+                let script = ADD_LIBRARY_REFERENCE_SCRIPT_TEMPLATE.replace("{PROJECT_FILE_PATH}", escProj);
+                script = script.replace("{LIB_NAME}", (libraryName ?? "").trim());
+                script = script.replace("{LIB_FILEPATH}", absLib.replace(/\\/g, '\\\\'));
+                script = script.replace("{AS_PLACEHOLDER}", asPlaceholder ? "True" : "False");
+                script = script.replace("{PLACEHOLDER_NAME}", (placeholderName ?? "").trim());
+                console.error(">>> add_library_reference: PREPARED SCRIPT:", script.substring(0, 400) + "...");
+                const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
+                console.error(">>> add_library_reference: EXECUTION RESULT:", JSON.stringify(result));
+                const success = result.success && result.output.includes("SCRIPT_SUCCESS");
+                return { content: [{ type: "text", text: success ? `Library reference added to ${absPath} (name='${libraryName ?? ''}', file='${absLib}'). Project saved.` : `Failed to add library reference. Output:\n${result.output}` }], isError: !success };
+            } catch (e:any) {
+                console.error(`Error add_library_reference in ${absPath}: ${e}`);
+                return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
+            }
+        }
+    );
+
+    server.tool(
         "set_pou_code", // Tool Name
         "Sets the declaration and/or implementation code for a specific POU, Method, or Property.", // Tool Description
         { // Input Schema
@@ -2627,6 +2942,182 @@ except Exception as e:
             }
         }
     );
+
+    // ===================== Stufe B: Geraetebaum-Werkzeuge (list/import/add device) =====================
+    const LIST_DEVICES_SCRIPT_TEMPLATE = `
+import sys, scriptengine as script_engine, traceback
+try:
+    name_f = "{NAME_FILTER}".lower()
+    vendor_f = "{VENDOR_FILTER}".lower()
+    print("--- DEVICE LIST START ---")
+    n = 0
+    for dev in script_engine.device_repository.get_all_devices():
+        di = dev.device_info
+        nm = getattr(di, "name", None) or getattr(di, "description", "") or ""
+        vd = getattr(di, "vendor", "") or ""
+        low = (nm + " " + vd).lower()
+        if name_f and name_f not in low: continue
+        if vendor_f and vendor_f not in low: continue
+        d = dev.device_id
+        print("DEV|%s|%s|%s|%s|%s" % (nm, vd, d.type, d.id, d.version))
+        n += 1
+    print("--- DEVICE LIST END ---")
+    print("Count: %d" % n)
+    print("SCRIPT_SUCCESS")
+except Exception as ex:
+    print("SCRIPT_ERROR: %s" % ex); traceback.print_exc(); sys.exit(1)
+`;
+
+    const IMPORT_DEVICE_SCRIPT_TEMPLATE = `
+import sys, os, scriptengine as script_engine, traceback
+from System import Guid
+try:
+    p = "{GSDML_PATH}"
+    if not os.path.exists(p):
+        print("SCRIPT_ERROR: file not found: %s" % p); sys.exit(1)
+    conv = Guid("{CONVERTER_GUID}")
+    src = script_engine.device_repository.sources[0]
+    before = len(list(script_engine.device_repository.get_all_devices()))
+    devid = script_engine.device_repository.import_device(p, src, conv, True)
+    after = len(list(script_engine.device_repository.get_all_devices()))
+    print("Imported: %s" % (devid,))
+    print("Added: %d" % (after - before))
+    print("SCRIPT_SUCCESS")
+except Exception as ex:
+    print("SCRIPT_ERROR: %s" % ex); traceback.print_exc(); sys.exit(1)
+`;
+
+    const ADD_DEVICE_SCRIPT_TEMPLATE = `
+${ENSURE_PROJECT_OPEN_PYTHON_SNIPPET}
+try:
+    ensure_project_open("{PROJECT_FILE_PATH}")
+    proj = script_engine.projects.primary
+    if proj is None:
+        print("SCRIPT_ERROR: no primary project after open"); sys.exit(1)
+    want_name = "{DEVICE_NAME}".lower()
+    want_ver = "{DEVICE_VERSION}"
+    chosen = None
+    for dev in script_engine.device_repository.get_all_devices():
+        di = dev.device_info
+        nm = (getattr(di, "name", None) or getattr(di, "description", "") or "")
+        if want_name in nm.lower() and (not want_ver or want_ver in str(dev.device_id.version)):
+            chosen = dev; break
+    if chosen is None:
+        print("SCRIPT_ERROR: device not found in repository: %s" % want_name); sys.exit(1)
+    parent_name = "{PARENT_NAME}"
+    if parent_name:
+        matches = proj.find(parent_name, True)
+        if not matches:
+            print("SCRIPT_ERROR: parent node not found: %s" % parent_name); sys.exit(1)
+        parent = matches[0]
+    else:
+        parent = proj
+    inst = "{INSTANCE_NAME}"
+    parent.add(inst, chosen.device_id)
+    node = None
+    for k in reversed(list(parent.get_children(False))):
+        try:
+            if k.get_name() == inst:
+                node = k; break
+        except Exception:
+            pass
+    proj.save()
+    print("AddedDevice: %s under %s" % (inst, parent_name or "<project>"))
+    print("NodeFound: %s" % ("yes" if node else "no"))
+    print("SCRIPT_SUCCESS")
+except Exception as ex:
+    print("SCRIPT_ERROR: %s" % ex); traceback.print_exc(); sys.exit(1)
+`;
+
+    server.tool(
+        "list_devices",
+        "Lists devices in the CODESYS device repository, optionally filtered by name and/or vendor substring. Returns name, vendor and device identification (type, id, version) needed for add_device.",
+        {
+            nameFilter: z.string().optional().describe("Case-insensitive substring for the device name/description (e.g. 'ET200S', 'IM151-3 PN HF', '8741')."),
+            vendorFilter: z.string().optional().describe("Case-insensitive substring for the vendor (e.g. 'Siemens', 'buerkert').")
+        },
+        async (args) => {
+            const { nameFilter, vendorFilter } = args;
+            try {
+                let script = LIST_DEVICES_SCRIPT_TEMPLATE.replace("{NAME_FILTER}", (nameFilter ?? "").replace(/"/g, ""));
+                script = script.replace("{VENDOR_FILTER}", (vendorFilter ?? "").replace(/"/g, ""));
+                const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
+                const ok = result.success && result.output.includes("SCRIPT_SUCCESS");
+                const s = result.output.indexOf("--- DEVICE LIST START ---");
+                const e = result.output.indexOf("--- DEVICE LIST END ---");
+                const list = (s !== -1 && e !== -1) ? result.output.substring(s, e).split(/[\r\n]+/).filter(l => l.startsWith("DEV|")).join("\n") : "";
+                const message = ok ? (list || "No matching devices found.") : `list_devices failed. Output:\n${result.output}`;
+                return { content: [{ type: "text", text: message }], isError: !ok };
+            } catch (e:any) {
+                return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
+            }
+        }
+    );
+
+    server.tool(
+        "import_device",
+        "Imports a device description (GSDML/GSD/EDS) into the CODESYS device repository so it can be placed in the device tree. GSDML files must be real XML with a .xml extension. Uses the universal converter factory.",
+        {
+            filePath: z.string().describe("Absolute path to the device description file (e.g. 'C:/.../GSDML-...-ET200S.xml'). GSDML must be .xml."),
+            converterGuid: z.string().optional().describe("Converter factory GUID. Defaults to C633F245-876F-45E8-AAB4-3FBD994C08B8 (auto-detects GSDML/GSD/EDS).")
+        },
+        async (args) => {
+            const { filePath, converterGuid } = args;
+            let absPath = path.normalize(path.isAbsolute(filePath) ? filePath : path.join(WORKSPACE_DIR, filePath));
+            try {
+                if (!(await fileExists(absPath))) {
+                    return { content: [{ type: "text", text: `Error: device description file not found: ${absPath}` }], isError: true };
+                }
+                const guid = (converterGuid ?? "C633F245-876F-45E8-AAB4-3FBD994C08B8").replace(/[{}]/g, "");
+                let script = IMPORT_DEVICE_SCRIPT_TEMPLATE.replace("{GSDML_PATH}", absPath.replace(/\\/g, "\\\\"));
+                script = script.replace("{CONVERTER_GUID}", "{" + guid + "}");
+                const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
+                const ok = result.success && result.output.includes("SCRIPT_SUCCESS");
+                const added = (result.output.match(/Added:\s*(\d+)/) || [])[1];
+                const imported = (result.output.match(/Imported:\s*(.+)/) || [])[1];
+                const message = ok
+                    ? `Device description imported into repository. New entries: ${added ?? "?"}.${imported ? " DeviceID: " + imported.trim() : ""}`
+                    : `import_device failed for ${absPath}. Output:\n${result.output}`;
+                return { content: [{ type: "text", text: message }], isError: !ok };
+            } catch (e:any) {
+                return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
+            }
+        }
+    );
+
+    server.tool(
+        "add_device",
+        "Adds a device from the repository into the project tree, nested under a parent node identified by its object name. Use list_devices first. The parent must accept the child (e.g. a ProfiNet IO device goes under a PN-Controller, not directly under Ethernet).",
+        {
+            projectFilePath: z.string().describe("Path to the .project file to modify."),
+            deviceName: z.string().describe("Substring of the repository device name to add (e.g. 'IM151-3 PN HF', 'Type 8741 PROFINET', 'PN-Controller', 'Ethernet')."),
+            deviceVersion: z.string().optional().describe("Optional version substring to disambiguate (e.g. 'V07.00', '3.5.22')."),
+            instanceName: z.string().describe("Name for the new node in the tree (no spaces, e.g. 'RIO_ET200S', 'FlowSensor')."),
+            parentName: z.string().optional().describe("Object name of the parent node to add under (e.g. 'PN_Controller', 'Ethernet_1'). Omit to add at the top level (PLC device).")
+        },
+        async (args) => {
+            const { projectFilePath, deviceName, deviceVersion, instanceName, parentName } = args;
+            let absPath = path.normalize(path.isAbsolute(projectFilePath) ? projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+            try {
+                const escProj = absPath.replace(/\\/g, "\\\\");
+                let script = ADD_DEVICE_SCRIPT_TEMPLATE.replace("{PROJECT_FILE_PATH}", escProj);
+                script = script.replace("{DEVICE_NAME}", deviceName.replace(/"/g, ""));
+                script = script.replace("{DEVICE_VERSION}", (deviceVersion ?? "").replace(/"/g, ""));
+                script = script.replace("{PARENT_NAME}", (parentName ?? "").replace(/"/g, ""));
+                script = script.replace("{INSTANCE_NAME}", instanceName.replace(/"/g, ""));
+                const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
+                const ok = result.success && result.output.includes("SCRIPT_SUCCESS");
+                const added = (result.output.match(/AddedDevice:\s*(.+)/) || [])[1];
+                const message = ok
+                    ? `Device added: ${added ? added.trim() : instanceName}. Project saved.`
+                    : `add_device failed. Output:\n${result.output}`;
+                return { content: [{ type: "text", text: message }], isError: !ok };
+            } catch (e:any) {
+                return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
+            }
+        }
+    );
+
     // --- End Tools ---
 
     console.error("SERVER.TS: Resources and Tools defined.");
