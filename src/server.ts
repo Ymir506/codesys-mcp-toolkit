@@ -3130,25 +3130,40 @@ try:
     if not matches:
         print("SCRIPT_ERROR: device node not found: %s" % dev_name); sys.exit(1)
     node = matches[0]
-    if not hasattr(node, "device_parameters"):
-        print("SCRIPT_ERROR: node has no device parameters: %s" % dev_name); sys.exit(1)
-    params = node.device_parameters()
+    def all_params(nd):
+        out = []
+        try:
+            conns = nd.connectors
+            conns = conns() if callable(conns) else conns
+            for c in conns:
+                hp = getattr(c, "host_parameters", None)
+                if hp is None: continue
+                hp = hp() if callable(hp) else hp
+                for p in hp:
+                    out.append(p)
+        except Exception:
+            pass
+        try:
+            dp = getattr(nd, "device_parameters", None)
+            if dp is not None:
+                dp = dp() if callable(dp) else dp
+                for p in dp:
+                    out.append(p)
+        except Exception:
+            pass
+        return out
+    params = all_params(node)
     match = "{PARAM_MATCH}"
     value = "{VALUE}"
     if not match:
         print("--- PARAM LIST START ---")
         for p in params:
             try:
-                pid = getattr(p, "id", "")
-                nm = getattr(p, "name", "") or ""
-                try:
-                    val = p.value
-                except Exception:
-                    val = "<compound>"
-                ct = getattr(p, "channel_type", "")
-                print("PARAM|%s|%s|%s|%s" % (pid, nm, ct, val))
+                try: val = p.value
+                except Exception: val = "<compound>"
+                print("PARAM|%s|%s|%s|%s" % (getattr(p,"id",""), getattr(p,"name","") or "", getattr(p,"is_mappable_io",False), val))
             except Exception as e2:
-                print("PARAM|?|<err %s>|" % e2)
+                print("PARAM|?|<err %s>||" % e2)
         print("--- PARAM LIST END ---")
         print("SCRIPT_SUCCESS")
     else:
@@ -3167,13 +3182,11 @@ try:
         if target is None:
             print("SCRIPT_ERROR: parameter not found: %s" % match); sys.exit(1)
         old = ""
-        try:
-            old = target.value
-        except Exception:
-            pass
+        try: old = target.value
+        except Exception: pass
         target.value = value
         proj.save()
-        print("ParamSet: id=%s name=%s old=%s new=%s" % (getattr(target, "id", ""), getattr(target, "name", ""), old, value))
+        print("ParamSet: id=%s name=%s old=%s new=%s" % (getattr(target,"id",""), getattr(target,"name",""), old, value))
         print("SCRIPT_SUCCESS")
 except Exception as ex:
     print("SCRIPT_ERROR: %s" % ex); traceback.print_exc(); sys.exit(1)
@@ -3191,49 +3204,51 @@ try:
     if not matches:
         print("SCRIPT_ERROR: device node not found: %s" % dev_name); sys.exit(1)
     node = matches[0]
-    if not hasattr(node, "device_parameters"):
-        print("SCRIPT_ERROR: node has no device parameters: %s" % dev_name); sys.exit(1)
-    params = node.device_parameters()
+    def all_params(nd):
+        out = []
+        try:
+            conns = nd.connectors
+            conns = conns() if callable(conns) else conns
+            for c in conns:
+                hp = getattr(c, "host_parameters", None)
+                if hp is None: continue
+                hp = hp() if callable(hp) else hp
+                for p in hp:
+                    out.append(p)
+        except Exception:
+            pass
+        return out
+    def cur_addr(m):
+        try: return m.manual_iec_address or ""
+        except Exception: return ""
+    def cur_var(m):
+        try: return m.variable or ""
+        except Exception: return ""
+    params = all_params(node)
     match = "{CHANNEL_MATCH}"
     variable = "{VARIABLE}"
     address = "{ADDRESS}"
-    def cur_addr(m):
-        try:
-            return m.manual_iec_address or ""
-        except Exception:
-            return ""
-    def cur_var(m):
-        try:
-            return m.variable or ""
-        except Exception:
-            return ""
     if not match:
         print("--- IO LIST START ---")
         for p in params:
             try:
-                if not getattr(p, "is_mappable_io", False):
-                    continue
+                if not getattr(p, "is_mappable_io", False): continue
                 m = p.io_mapping
-                if m is None:
-                    continue
-                nm = getattr(p, "name", "") or ""
-                ct = getattr(p, "channel_type", "")
-                print("IO|%s|%s|%s|%s|%s" % (getattr(p, "id", ""), nm, ct, cur_addr(m), cur_var(m)))
+                if m is None: continue
+                print("IO|%s|%s|%s|%s" % (getattr(p,"id",""), getattr(p,"name","") or "", cur_addr(m), cur_var(m)))
             except Exception as e2:
-                print("IO|?|<err %s>|||" % e2)
+                print("IO|?|<err %s>||" % e2)
         print("--- IO LIST END ---")
         print("SCRIPT_SUCCESS")
     else:
         target = None
         for p in params:
             try:
-                if not getattr(p, "is_mappable_io", False):
-                    continue
+                if not getattr(p, "is_mappable_io", False): continue
                 m = p.io_mapping
-                if m is None:
-                    continue
+                if m is None: continue
                 nm = (getattr(p, "name", "") or "").lower()
-                if match.lower() in nm or match == cur_addr(m):
+                if match.lower() in nm or match == cur_addr(m) or match == str(getattr(p,"id","")):
                     target = (p, m); break
             except Exception:
                 pass
@@ -3245,7 +3260,7 @@ try:
         if address:
             m.manual_iec_address = address
         proj.save()
-        print("IoMapped: name=%s var=%s addr=%s" % (getattr(p, "name", ""), variable, address or cur_addr(m)))
+        print("IoMapped: name=%s var=%s addr=%s" % (getattr(p,"name",""), variable, address or cur_addr(m)))
         print("SCRIPT_SUCCESS")
 except Exception as ex:
     print("SCRIPT_ERROR: %s" % ex); traceback.print_exc(); sys.exit(1)
