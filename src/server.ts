@@ -3118,6 +3118,215 @@ except Exception as ex:
         }
     );
 
+    const SET_DEVICE_PARAMETER_SCRIPT_TEMPLATE = `
+${ENSURE_PROJECT_OPEN_PYTHON_SNIPPET}
+try:
+    ensure_project_open("{PROJECT_FILE_PATH}")
+    proj = script_engine.projects.primary
+    if proj is None:
+        print("SCRIPT_ERROR: no primary project after open"); sys.exit(1)
+    dev_name = "{DEVICE_NAME}"
+    matches = proj.find(dev_name, True)
+    if not matches:
+        print("SCRIPT_ERROR: device node not found: %s" % dev_name); sys.exit(1)
+    node = matches[0]
+    if not hasattr(node, "device_parameters"):
+        print("SCRIPT_ERROR: node has no device parameters: %s" % dev_name); sys.exit(1)
+    params = node.device_parameters()
+    match = "{PARAM_MATCH}"
+    value = "{VALUE}"
+    if not match:
+        print("--- PARAM LIST START ---")
+        for p in params:
+            try:
+                pid = getattr(p, "id", "")
+                nm = getattr(p, "name", "") or ""
+                try:
+                    val = p.value
+                except Exception:
+                    val = "<compound>"
+                ct = getattr(p, "channel_type", "")
+                print("PARAM|%s|%s|%s|%s" % (pid, nm, ct, val))
+            except Exception as e2:
+                print("PARAM|?|<err %s>|" % e2)
+        print("--- PARAM LIST END ---")
+        print("SCRIPT_SUCCESS")
+    else:
+        try:
+            mid = int(match)
+        except Exception:
+            mid = None
+        target = None
+        for p in params:
+            if mid is not None:
+                if getattr(p, "id", None) == mid:
+                    target = p; break
+            else:
+                if match.lower() in (getattr(p, "name", "") or "").lower():
+                    target = p; break
+        if target is None:
+            print("SCRIPT_ERROR: parameter not found: %s" % match); sys.exit(1)
+        old = ""
+        try:
+            old = target.value
+        except Exception:
+            pass
+        target.value = value
+        proj.save()
+        print("ParamSet: id=%s name=%s old=%s new=%s" % (getattr(target, "id", ""), getattr(target, "name", ""), old, value))
+        print("SCRIPT_SUCCESS")
+except Exception as ex:
+    print("SCRIPT_ERROR: %s" % ex); traceback.print_exc(); sys.exit(1)
+`;
+
+    const SET_IO_MAPPING_SCRIPT_TEMPLATE = `
+${ENSURE_PROJECT_OPEN_PYTHON_SNIPPET}
+try:
+    ensure_project_open("{PROJECT_FILE_PATH}")
+    proj = script_engine.projects.primary
+    if proj is None:
+        print("SCRIPT_ERROR: no primary project after open"); sys.exit(1)
+    dev_name = "{DEVICE_NAME}"
+    matches = proj.find(dev_name, True)
+    if not matches:
+        print("SCRIPT_ERROR: device node not found: %s" % dev_name); sys.exit(1)
+    node = matches[0]
+    if not hasattr(node, "device_parameters"):
+        print("SCRIPT_ERROR: node has no device parameters: %s" % dev_name); sys.exit(1)
+    params = node.device_parameters()
+    match = "{CHANNEL_MATCH}"
+    variable = "{VARIABLE}"
+    address = "{ADDRESS}"
+    def cur_addr(m):
+        try:
+            return m.manual_iec_address or ""
+        except Exception:
+            return ""
+    def cur_var(m):
+        try:
+            return m.variable or ""
+        except Exception:
+            return ""
+    if not match:
+        print("--- IO LIST START ---")
+        for p in params:
+            try:
+                if not getattr(p, "is_mappable_io", False):
+                    continue
+                m = p.io_mapping
+                if m is None:
+                    continue
+                nm = getattr(p, "name", "") or ""
+                ct = getattr(p, "channel_type", "")
+                print("IO|%s|%s|%s|%s|%s" % (getattr(p, "id", ""), nm, ct, cur_addr(m), cur_var(m)))
+            except Exception as e2:
+                print("IO|?|<err %s>|||" % e2)
+        print("--- IO LIST END ---")
+        print("SCRIPT_SUCCESS")
+    else:
+        target = None
+        for p in params:
+            try:
+                if not getattr(p, "is_mappable_io", False):
+                    continue
+                m = p.io_mapping
+                if m is None:
+                    continue
+                nm = (getattr(p, "name", "") or "").lower()
+                if match.lower() in nm or match == cur_addr(m):
+                    target = (p, m); break
+            except Exception:
+                pass
+        if target is None:
+            print("SCRIPT_ERROR: mappable channel not found: %s" % match); sys.exit(1)
+        p, m = target
+        if variable:
+            m.variable = variable
+        if address:
+            m.manual_iec_address = address
+        proj.save()
+        print("IoMapped: name=%s var=%s addr=%s" % (getattr(p, "name", ""), variable, address or cur_addr(m)))
+        print("SCRIPT_SUCCESS")
+except Exception as ex:
+    print("SCRIPT_ERROR: %s" % ex); traceback.print_exc(); sys.exit(1)
+`;
+
+    server.tool(
+        "set_device_parameter",
+        "Reads or sets a parameter on a device node. Omit 'parameter' to LIST all parameters (id | name | channelType | value) for discovery; provide 'parameter' (id number or name substring) plus 'value' to set one. Typical use: assign the network adapter of an 'Ethernet' node, or a PROFINET IP.",
+        {
+            projectFilePath: z.string().describe("Path to the .project file to read/modify."),
+            deviceName: z.string().describe("Object name (substring) of the device node, e.g. 'Ethernet', 'PN_Controller', 'ET200S'."),
+            parameter: z.string().optional().describe("Parameter id (number as string, exact) or a name substring. Omit to list all parameters."),
+            value: z.string().optional().describe("New value to assign. Required together with 'parameter'.")
+        },
+        async (args) => {
+            const { projectFilePath, deviceName, parameter, value } = args;
+            let absPath = path.normalize(path.isAbsolute(projectFilePath) ? projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+            try {
+                const escProj = absPath.replace(/\\/g, "\\\\");
+                let script = SET_DEVICE_PARAMETER_SCRIPT_TEMPLATE.replace("{PROJECT_FILE_PATH}", escProj);
+                script = script.replace("{DEVICE_NAME}", deviceName.replace(/"/g, ""));
+                script = script.replace("{PARAM_MATCH}", (parameter ?? "").replace(/"/g, ""));
+                script = script.replace("{VALUE}", (value ?? "").replace(/"/g, ""));
+                const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
+                const ok = result.success && result.output.includes("SCRIPT_SUCCESS");
+                let text;
+                if (!parameter) {
+                    const s = result.output.indexOf("--- PARAM LIST START ---");
+                    const e = result.output.indexOf("--- PARAM LIST END ---");
+                    const list = (s !== -1 && e !== -1) ? result.output.substring(s, e).split(/[\r\n]+/).filter(l => l.startsWith("PARAM|")).join("\n") : "";
+                    text = ok ? (list || "No parameters found.") : `set_device_parameter (list) failed. Output:\n${result.output}`;
+                } else {
+                    const setLine = (result.output.match(/ParamSet:\s*(.+)/) || [])[1];
+                    text = ok ? `Parameter set. ${setLine ? setLine.trim() : ""}` : `set_device_parameter failed. Output:\n${result.output}`;
+                }
+                return { content: [{ type: "text", text }], isError: !ok };
+            } catch (e:any) {
+                return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
+            }
+        }
+    );
+
+    server.tool(
+        "set_io_mapping",
+        "Reads or sets the I/O mapping of a device's channels. Omit 'channel' to LIST mappable channels (id | name | channelType | address | variable); provide 'channel' (name substring or current IEC address) plus 'variable' and/or 'address' to map one channel. An unqualified variable name creates a new variable; a qualified name maps to an existing one.",
+        {
+            projectFilePath: z.string().describe("Path to the .project file to read/modify."),
+            deviceName: z.string().describe("Object name (substring) of the module/device carrying the channels, e.g. '2DI', '2DO', 'FlowSensor'."),
+            channel: z.string().optional().describe("Channel selector: a name substring or the current IEC address (e.g. '%IX46.0'). Omit to list all mappable channels."),
+            variable: z.string().optional().describe("Symbolic variable name to assign (e.g. 'LSH'). Unqualified => creates a variable."),
+            address: z.string().optional().describe("Manual IEC address to assign (e.g. '%QX4.0'). Omit to keep the current/automatic address.")
+        },
+        async (args) => {
+            const { projectFilePath, deviceName, channel, variable, address } = args;
+            let absPath = path.normalize(path.isAbsolute(projectFilePath) ? projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+            try {
+                const escProj = absPath.replace(/\\/g, "\\\\");
+                let script = SET_IO_MAPPING_SCRIPT_TEMPLATE.replace("{PROJECT_FILE_PATH}", escProj);
+                script = script.replace("{DEVICE_NAME}", deviceName.replace(/"/g, ""));
+                script = script.replace("{CHANNEL_MATCH}", (channel ?? "").replace(/"/g, ""));
+                script = script.replace("{VARIABLE}", (variable ?? "").replace(/"/g, ""));
+                script = script.replace("{ADDRESS}", (address ?? "").replace(/"/g, ""));
+                const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
+                const ok = result.success && result.output.includes("SCRIPT_SUCCESS");
+                let text;
+                if (!channel) {
+                    const s = result.output.indexOf("--- IO LIST START ---");
+                    const e = result.output.indexOf("--- IO LIST END ---");
+                    const list = (s !== -1 && e !== -1) ? result.output.substring(s, e).split(/[\r\n]+/).filter(l => l.startsWith("IO|")).join("\n") : "";
+                    text = ok ? (list || "No mappable channels found.") : `set_io_mapping (list) failed. Output:\n${result.output}`;
+                } else {
+                    const setLine = (result.output.match(/IoMapped:\s*(.+)/) || [])[1];
+                    text = ok ? `Channel mapped. ${setLine ? setLine.trim() : ""}` : `set_io_mapping failed. Output:\n${result.output}`;
+                }
+                return { content: [{ type: "text", text }], isError: !ok };
+            } catch (e:any) {
+                return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
+            }
+        }
+    );
+
     // --- End Tools ---
 
     console.error("SERVER.TS: Resources and Tools defined.");
